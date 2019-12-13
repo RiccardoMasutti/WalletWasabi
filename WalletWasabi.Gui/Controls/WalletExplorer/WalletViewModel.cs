@@ -9,6 +9,7 @@ using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using WalletWasabi.Gui.ViewModels;
 using WalletWasabi.Services;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Controls.WalletExplorer
 {
@@ -56,7 +57,6 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 			var advancedAction = new WalletAdvancedViewModel(this);
 			WalletInfoViewModel infoTab = new WalletInfoViewModel(this);
 			SendTabViewModel buildTab = new SendTabViewModel(this, isTransactionBuilder: true);
-			TransactionBroadcasterViewModel broadcastTab = new TransactionBroadcasterViewModel(this);
 
 			Actions.Add(receiveTab);
 			Actions.Add(coinjoinTab);
@@ -65,7 +65,6 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 			Actions.Add(advancedAction);
 			advancedAction.Items.Add(infoTab);
 			advancedAction.Items.Add(buildTab);
-			advancedAction.Items.Add(broadcastTab);
 
 			// Open and select tabs.
 			sendTab?.DisplayActionTab();
@@ -87,28 +86,34 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 				Global.UiConfig.LurkingWifeMode = !Global.UiConfig.LurkingWifeMode;
 				await Global.UiConfig.ToFileAsync();
 			});
+
+			LurkingWifeModeCommand.ThrownExceptions
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 		}
 
 		public void OnWalletOpened()
 		{
 			Disposables = Disposables is null ? new CompositeDisposable() : throw new NotSupportedException($"Cannot open {GetType().Name} before closing it.");
 
-			var observed = Observable.Merge(
-				Global.UiConfig.WhenAnyValue(x => x.LurkingWifeMode).Select(_ => Unit.Default),
-				Observable.FromEventPattern(Global.WalletService.Coins, nameof(Global.WalletService.Coins.CollectionChanged)).Select(_ => Unit.Default),
-				Observable.FromEventPattern(Global.WalletService.TransactionProcessor, nameof(Global.WalletService.TransactionProcessor.CoinSpent)).Select(_ => Unit.Default))
-				.Throttle(TimeSpan.FromSeconds(1))
-				.ObserveOn(RxApp.MainThreadScheduler);
-
-			observed.Subscribe(_ =>
-			{
-				Money balance = Enumerable.Where(WalletService.Coins, c => c.Unspent && !c.SpentAccordingToBackend).Sum(c => (long?)c.Amount) ?? 0;
-
-				Title = $"{Name} ({(Global.UiConfig.LurkingWifeMode ? "#########" : balance.ToString(false, true))} BTC)";
-			})
-			.DisposeWith(Disposables);
-
-			observed.Next();
+			Observable.Merge(
+				Observable.FromEventPattern(Global.WalletService.TransactionProcessor, nameof(Global.WalletService.TransactionProcessor.WalletRelevantTransactionProcessed)).Select(_ => Unit.Default))
+				.Throttle(TimeSpan.FromSeconds(0.1))
+				.Merge(Global.UiConfig.WhenAnyValue(x => x.LurkingWifeMode).Select(_ => Unit.Default))
+				.ObserveOn(RxApp.MainThreadScheduler)
+				.Subscribe(_ =>
+				{
+					try
+					{
+						Money balance = WalletService.Coins.TotalAmount();
+						Title = $"{Name} ({(Global.UiConfig.LurkingWifeMode ? "#########" : balance.ToString(false, true))} BTC)";
+					}
+					catch (Exception ex)
+					{
+						Logger.LogError(ex);
+					}
+				})
+				.DisposeWith(Disposables);
 
 			IsExpanded = true;
 		}

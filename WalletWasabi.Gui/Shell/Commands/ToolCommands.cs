@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Diagnostics;
 using AvalonStudio.Commands;
 using AvalonStudio.Extensibility;
@@ -13,6 +14,7 @@ using System.Reactive.Linq;
 using WalletWasabi.Gui.Controls.WalletExplorer;
 using WalletWasabi.Gui.Tabs;
 using WalletWasabi.Gui.Tabs.WalletManager;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Shell.Commands
 {
@@ -27,37 +29,24 @@ namespace WalletWasabi.Gui.Shell.Commands
 			var walletManagerCommand = ReactiveCommand.Create(OnWalletManager);
 
 			var settingsCommand = ReactiveCommand.Create(() =>
-			{
-				IoC.Get<IShell>().AddOrSelectDocument(() => new SettingsViewModel(Global));
-			});
+				IoC.Get<IShell>().AddOrSelectDocument(() => new SettingsViewModel(Global)));
+
+			var transactionBroadcasterCommand = ReactiveCommand.Create(() =>
+				IoC.Get<IShell>().AddOrSelectDocument(() => new TransactionBroadcasterViewModel(Global)));
 
 #if DEBUG
 			var devToolsCommand = ReactiveCommand.Create(() =>
-			{
-				var devTools = new DevTools(Application.Current.Windows.FirstOrDefault());
-
-				var devToolsWindow = new Window
-				{
-					Width = 1024,
-					Height = 512,
-					Content = devTools,
-					DataTemplates =
-						{
-							new ViewLocator<Avalonia.Diagnostics.ViewModels.ViewModelBase>()
-						}
-				};
-
-				devToolsWindow.Show();
-			});
+				DevToolsExtensions.OpenDevTools((Application.Current.ApplicationLifetime as IClassicDesktopStyleApplicationLifetime).MainWindow));
 #endif
-
 			Observable
 				.Merge(walletManagerCommand.ThrownExceptions)
 				.Merge(settingsCommand.ThrownExceptions)
+				.Merge(transactionBroadcasterCommand.ThrownExceptions)
 #if DEBUG
 				.Merge(devToolsCommand.ThrownExceptions)
 #endif
-				.Subscribe(OnException);
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 
 			WalletManagerCommand = new CommandDefinition(
 				"Wallet Manager",
@@ -68,6 +57,11 @@ namespace WalletWasabi.Gui.Shell.Commands
 				"Settings",
 				commandIconService.GetCompletionKindImage("Settings"),
 				settingsCommand);
+
+			TransactionBroadcasterCommand = new CommandDefinition(
+				"Transaction Broadcaster",
+				commandIconService.GetCompletionKindImage("BroadcastTransaction"),
+				transactionBroadcasterCommand);
 
 #if DEBUG
 			DevToolsCommand = new CommandDefinition(
@@ -90,16 +84,14 @@ namespace WalletWasabi.Gui.Shell.Commands
 			}
 		}
 
-		private void OnException(Exception ex)
-		{
-			Logging.Logger.LogError<ToolCommands>(ex);
-		}
-
 		[ExportCommandDefinition("Tools.WalletManager")]
 		public CommandDefinition WalletManagerCommand { get; }
 
 		[ExportCommandDefinition("Tools.Settings")]
 		public CommandDefinition SettingsCommand { get; }
+
+		[ExportCommandDefinition("Tools.BroadcastTransaction")]
+		public CommandDefinition TransactionBroadcasterCommand { get; }
 
 #if DEBUG
 

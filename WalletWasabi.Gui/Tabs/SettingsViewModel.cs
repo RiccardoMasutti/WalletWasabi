@@ -13,9 +13,12 @@ using System.Reactive.Disposables;
 using System.Reactive.Linq;
 using System.Reactive.Threading.Tasks;
 using System.Text.RegularExpressions;
+using WalletWasabi.Gui.Helpers;
 using WalletWasabi.Gui.ViewModels;
 using WalletWasabi.Gui.ViewModels.Validation;
 using WalletWasabi.Helpers;
+using WalletWasabi.Models;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Tabs
 {
@@ -26,16 +29,18 @@ namespace WalletWasabi.Gui.Tabs
 		private Network _network;
 		private string _torSocks5EndPoint;
 		private string _bitcoinP2pEndPoint;
+		private string _localBitcoinCoreDataDir;
 		private bool _autocopy;
 		private bool _customFee;
 		private bool _useTor;
+		private bool _startLocalBitcoinCoreOnStartup;
+		private bool _stopLocalBitcoinCoreOnShutdown;
 		private bool _isModified;
 		private string _somePrivacyLevel;
 		private string _finePrivacyLevel;
 		private string _strongPrivacyLevel;
 		private string _dustThreshold;
 		private string _pinBoxText;
-		private string _pinWarningMessage;
 
 		private ObservableAsPropertyHelper<bool> _isPinSet;
 
@@ -57,16 +62,21 @@ namespace WalletWasabi.Gui.Tabs
 			Network = globalConfig.Network;
 			TorSocks5EndPoint = globalConfig.TorSocks5EndPoint.ToString(-1);
 			UseTor = globalConfig.UseTor;
+			StartLocalBitcoinCoreOnStartup = globalConfig.StartLocalBitcoinCoreOnStartup;
+			StopLocalBitcoinCoreOnShutdown = globalConfig.StopLocalBitcoinCoreOnShutdown;
 			SomePrivacyLevel = globalConfig.PrivacyLevelSome.ToString();
 			FinePrivacyLevel = globalConfig.PrivacyLevelFine.ToString();
 			StrongPrivacyLevel = globalConfig.PrivacyLevelStrong.ToString();
 			DustThreshold = globalConfig.DustThreshold.ToString();
 			BitcoinP2pEndPoint = globalConfig.GetP2PEndpoint().ToString(defaultPort: -1);
+			LocalBitcoinCoreDataDir = globalConfig.LocalBitcoinCoreDataDir;
 			IsModified = false;
 
 			this.WhenAnyValue(
 				x => x.Network,
-				x => x.UseTor)
+				x => x.UseTor,
+				x => x.StartLocalBitcoinCoreOnStartup,
+				x => x.StopLocalBitcoinCoreOnShutdown)
 				.ObserveOn(RxApp.TaskpoolScheduler)
 				.Subscribe(_ => Save());
 
@@ -81,56 +91,67 @@ namespace WalletWasabi.Gui.Tabs
 			OpenConfigFileCommand = ReactiveCommand.Create(OpenConfigFile);
 
 			LurkingWifeModeCommand = ReactiveCommand.CreateFromTask(async () =>
-			{
-				Global.UiConfig.LurkingWifeMode = !LurkingWifeMode;
-				await Global.UiConfig.ToFileAsync();
-			});
+				{
+					Global.UiConfig.LurkingWifeMode = !LurkingWifeMode;
+					await Global.UiConfig.ToFileAsync();
+				});
 
 			SetClearPinCommand = ReactiveCommand.Create(() =>
-			{
-				var pinBoxText = PinBoxText?.Trim();
-				if (string.IsNullOrWhiteSpace(pinBoxText))
 				{
-					PinWarningMessage = "Please provide PIN.";
-					return;
-				}
-
-				if (pinBoxText.Length > 10)
-				{
-					PinWarningMessage = "PIN too long.";
-					return;
-				}
-
-				if (pinBoxText.Any(x => !char.IsDigit(x)))
-				{
-					PinWarningMessage = "Invalid PIN.";
-					return;
-				}
-
-				var uiConfigPinHash = Global.UiConfig.LockScreenPinHash;
-				var enteredPinHash = HashHelpers.GenerateSha256Hash(pinBoxText);
-
-				if (IsPinSet)
-				{
-					if (uiConfigPinHash != enteredPinHash)
+					var pinBoxText = PinBoxText;
+					if (string.IsNullOrEmpty(pinBoxText))
 					{
-						PinWarningMessage = "Wrong PIN.";
-						PinBoxText = string.Empty;
+						NotificationHelpers.Error("Please provide a PIN.");
 						return;
 					}
 
-					Global.UiConfig.LockScreenPinHash = string.Empty;
-				}
-				else
-				{
-					Global.UiConfig.LockScreenPinHash = enteredPinHash;
-				}
+					var trimmedPinBoxText = pinBoxText?.Trim();
+					if (string.IsNullOrEmpty(trimmedPinBoxText)
+						|| trimmedPinBoxText.Any(x => !char.IsDigit(x)))
+					{
+						NotificationHelpers.Error("Invalid PIN.");
+						return;
+					}
 
-				PinBoxText = string.Empty;
-				PinWarningMessage = string.Empty;
-			});
+					if (trimmedPinBoxText.Length > 10)
+					{
+						NotificationHelpers.Error("PIN is too long.");
+						return;
+					}
+
+					var uiConfigPinHash = Global.UiConfig.LockScreenPinHash;
+					var enteredPinHash = HashHelpers.GenerateSha256Hash(trimmedPinBoxText);
+
+					if (IsPinSet)
+					{
+						if (uiConfigPinHash != enteredPinHash)
+						{
+							NotificationHelpers.Error("PIN is incorrect!");
+							PinBoxText = string.Empty;
+							return;
+						}
+
+						Global.UiConfig.LockScreenPinHash = string.Empty;
+						NotificationHelpers.Success("PIN cleared successfully.");
+					}
+					else
+					{
+						Global.UiConfig.LockScreenPinHash = enteredPinHash;
+						NotificationHelpers.Success("PIN changed successfully.");
+					}
+
+					PinBoxText = string.Empty;
+				});
 
 			TextBoxLostFocusCommand = ReactiveCommand.Create(Save);
+
+			Observable
+				.Merge(OpenConfigFileCommand.ThrownExceptions)
+				.Merge(LurkingWifeModeCommand.ThrownExceptions)
+				.Merge(SetClearPinCommand.ThrownExceptions)
+				.Merge(TextBoxLostFocusCommand.ThrownExceptions)
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 		}
 
 		public override void OnOpen()
@@ -146,6 +167,8 @@ namespace WalletWasabi.Gui.Tabs
 					Network = x.Network;
 					TorSocks5EndPoint = x.TorSocks5EndPoint.ToString(-1);
 					UseTor = x.UseTor;
+					StartLocalBitcoinCoreOnStartup = x.StartLocalBitcoinCoreOnStartup;
+					StopLocalBitcoinCoreOnShutdown = x.StopLocalBitcoinCoreOnShutdown;
 
 					SomePrivacyLevel = x.PrivacyLevelSome.ToString();
 					FinePrivacyLevel = x.PrivacyLevelFine.ToString();
@@ -154,6 +177,7 @@ namespace WalletWasabi.Gui.Tabs
 					DustThreshold = x.DustThreshold.ToString();
 
 					BitcoinP2pEndPoint = x.GetP2PEndpoint().ToString(defaultPort: -1);
+					LocalBitcoinCoreDataDir = x.LocalBitcoinCoreDataDir;
 
 					IsModified = !Global.Config.AreDeepEqual(x);
 				})
@@ -164,9 +188,11 @@ namespace WalletWasabi.Gui.Tabs
 				.Subscribe(_ => this.RaisePropertyChanged(nameof(LurkingWifeMode)))
 				.DisposeWith(Disposables);
 
-			_isPinSet = Global.UiConfig.WhenAnyValue(x => x.LockScreenPinHash, x => !string.IsNullOrWhiteSpace(x))
+			_isPinSet = Global.UiConfig
+				.WhenAnyValue(x => x.LockScreenPinHash, x => !string.IsNullOrWhiteSpace(x))
 				.ToProperty(this, x => x.IsPinSet, scheduler: RxApp.MainThreadScheduler)
 				.DisposeWith(Disposables);
+			this.RaisePropertyChanged(nameof(IsPinSet)); // Fire now otherwise the button won't update for restart.
 
 			Global.UiConfig.WhenAnyValue(x => x.LockScreenPinHash, x => x.Autocopy, x => x.IsCustomFee)
 				.Throttle(TimeSpan.FromSeconds(1))
@@ -184,6 +210,8 @@ namespace WalletWasabi.Gui.Tabs
 
 			return base.OnClose();
 		}
+
+		public Version BitcoinCoreVersion => Constants.BitcoinCoreVersion;
 
 		public IEnumerable<Network> Networks => new[]
 		{
@@ -212,6 +240,12 @@ namespace WalletWasabi.Gui.Tabs
 			set => this.RaiseAndSetIfChanged(ref _bitcoinP2pEndPoint, value);
 		}
 
+		public string LocalBitcoinCoreDataDir
+		{
+			get => _localBitcoinCoreDataDir;
+			set => this.RaiseAndSetIfChanged(ref _localBitcoinCoreDataDir, value);
+		}
+
 		public bool IsModified
 		{
 			get => _isModified;
@@ -228,6 +262,18 @@ namespace WalletWasabi.Gui.Tabs
 		{
 			get => _customFee;
 			set => this.RaiseAndSetIfChanged(ref _customFee, value);
+		}
+
+		public bool StartLocalBitcoinCoreOnStartup
+		{
+			get => _startLocalBitcoinCoreOnStartup;
+			set => this.RaiseAndSetIfChanged(ref _startLocalBitcoinCoreOnStartup, value);
+		}
+
+		public bool StopLocalBitcoinCoreOnShutdown
+		{
+			get => _stopLocalBitcoinCoreOnShutdown;
+			set => this.RaiseAndSetIfChanged(ref _stopLocalBitcoinCoreOnShutdown, value);
 		}
 
 		public bool UseTor
@@ -272,12 +318,6 @@ namespace WalletWasabi.Gui.Tabs
 			set => this.RaiseAndSetIfChanged(ref _pinBoxText, value);
 		}
 
-		public string PinWarningMessage
-		{
-			get => _pinWarningMessage;
-			set => this.RaiseAndSetIfChanged(ref _pinWarningMessage, value);
-		}
-
 		private void Save()
 		{
 			var network = Network;
@@ -287,12 +327,12 @@ namespace WalletWasabi.Gui.Tabs
 			}
 
 			var isValid =
-				string.IsNullOrEmpty(ValidatePrivacyLevel(SomePrivacyLevel, whiteSpaceOk: false))
-				&& string.IsNullOrEmpty(ValidatePrivacyLevel(FinePrivacyLevel, whiteSpaceOk: false))
-				&& string.IsNullOrEmpty(ValidatePrivacyLevel(StrongPrivacyLevel, whiteSpaceOk: false))
-				&& string.IsNullOrEmpty(ValidateDustThreshold(DustThreshold, whiteSpaceOk: false))
-				&& string.IsNullOrEmpty(ValidateEndPoint(TorSocks5EndPoint, Constants.DefaultTorSocksPort, whiteSpaceOk: false))
-				&& string.IsNullOrEmpty(ValidateEndPoint(BitcoinP2pEndPoint, network.DefaultPort, whiteSpaceOk: false));
+				!ValidatePrivacyLevel(SomePrivacyLevel, whiteSpaceOk: false).HasErrors
+				&& !ValidatePrivacyLevel(FinePrivacyLevel, whiteSpaceOk: false).HasErrors
+				&& !ValidatePrivacyLevel(StrongPrivacyLevel, whiteSpaceOk: false).HasErrors
+				&& !ValidateDustThreshold(DustThreshold, whiteSpaceOk: false).HasErrors
+				&& !ValidateEndPoint(TorSocks5EndPoint, Constants.DefaultTorSocksPort, whiteSpaceOk: false).HasErrors
+				&& !ValidateEndPoint(BitcoinP2pEndPoint, network.DefaultPort, whiteSpaceOk: false).HasErrors;
 
 			if (!isValid)
 			{
@@ -317,6 +357,9 @@ namespace WalletWasabi.Gui.Tabs
 							config.SetP2PEndpoint(p2pEp);
 						}
 						config.UseTor = UseTor;
+						config.StartLocalBitcoinCoreOnStartup = StartLocalBitcoinCoreOnStartup;
+						config.StopLocalBitcoinCoreOnShutdown = StopLocalBitcoinCoreOnShutdown;
+						config.LocalBitcoinCoreDataDir = Guard.Correct(LocalBitcoinCoreDataDir);
 						config.DustThreshold = decimal.TryParse(DustThreshold, out var threshold) ? Money.Coins(threshold) : Config.DefaultDustThreshold;
 						config.PrivacyLevelSome = int.TryParse(SomePrivacyLevel, out int level) ? level : Config.DefaultPrivacyLevelSome;
 						config.PrivacyLevelStrong = int.TryParse(StrongPrivacyLevel, out level) ? level : Config.DefaultPrivacyLevelStrong;
@@ -335,72 +378,77 @@ namespace WalletWasabi.Gui.Tabs
 
 		private void OpenConfigFile()
 		{
-			IoHelpers.OpenFileInTextEditor(Global.Config.FilePath);
+			FileHelpers.OpenFileInTextEditor(Global.Config.FilePath);
 		}
 
 		#region Validation
 
-		public string ValidateSomePrivacyLevel()
+		public ErrorDescriptors ValidateSomePrivacyLevel()
 			=> ValidatePrivacyLevel(SomePrivacyLevel, whiteSpaceOk: true);
 
-		public string ValidateFinePrivacyLevel()
+		public ErrorDescriptors ValidateFinePrivacyLevel()
 			=> ValidatePrivacyLevel(FinePrivacyLevel, whiteSpaceOk: true);
 
-		public string ValidateStrongPrivacyLevel()
+		public ErrorDescriptors ValidateStrongPrivacyLevel()
 			=> ValidatePrivacyLevel(StrongPrivacyLevel, whiteSpaceOk: true);
 
-		public string ValidateDustThreshold()
+		public ErrorDescriptors ValidateDustThreshold()
 			=> ValidateDustThreshold(DustThreshold, whiteSpaceOk: true);
 
-		public string ValidateTorSocks5EndPoint()
+		public ErrorDescriptors ValidateTorSocks5EndPoint()
 			=> ValidateEndPoint(TorSocks5EndPoint, Constants.DefaultTorSocksPort, whiteSpaceOk: true);
 
-		public string ValidateBitcoinP2pEndPoint()
+		public ErrorDescriptors ValidateBitcoinP2pEndPoint()
 			=> ValidateEndPoint(BitcoinP2pEndPoint, Network.DefaultPort, whiteSpaceOk: true);
 
-		public string ValidatePrivacyLevel(string value, bool whiteSpaceOk)
+		public ErrorDescriptors ValidatePrivacyLevel(string value, bool whiteSpaceOk)
 		{
 			if (whiteSpaceOk && string.IsNullOrWhiteSpace(value))
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
 			}
 
 			if (uint.TryParse(value, out _))
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
 			}
 
-			return "Invalid privacy level.";
+			return new ErrorDescriptors(new ErrorDescriptor(ErrorSeverity.Error, "Invalid privacy level."));
 		}
 
-		public string ValidateDustThreshold(string dustThreshold, bool whiteSpaceOk)
+		public ErrorDescriptors ValidateDustThreshold(string dustThreshold, bool whiteSpaceOk)
 		{
 			if (whiteSpaceOk && string.IsNullOrWhiteSpace(dustThreshold))
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
+			}
+
+			if (!string.IsNullOrEmpty(dustThreshold) && dustThreshold.Contains(',', StringComparison.InvariantCultureIgnoreCase))
+			{
+				return new ErrorDescriptors(new ErrorDescriptor(ErrorSeverity.Error, "Use decimal point instead of comma."));
 			}
 
 			if (decimal.TryParse(dustThreshold, out var dust) && dust >= 0)
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
 			}
 
-			return "Invalid dust threshold.";
+			return new ErrorDescriptors(new ErrorDescriptor(ErrorSeverity.Error, "Invalid dust threshold."));
 		}
 
-		public string ValidateEndPoint(string endPoint, int defaultPort, bool whiteSpaceOk)
+		public ErrorDescriptors ValidateEndPoint(string endPoint, int defaultPort, bool whiteSpaceOk)
 		{
 			if (whiteSpaceOk && string.IsNullOrWhiteSpace(endPoint))
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
 			}
 
 			if (EndPointParser.TryParse(endPoint, defaultPort, out _))
 			{
-				return string.Empty;
+				return ErrorDescriptors.Empty;
 			}
 
-			return "Invalid endpoint.";
+			return new ErrorDescriptors(new ErrorDescriptor(ErrorSeverity.Error, "Invalid endpoint."));
 		}
 
 		#endregion Validation

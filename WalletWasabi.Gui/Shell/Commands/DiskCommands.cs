@@ -4,6 +4,8 @@ using System;
 using System.Composition;
 using System.IO;
 using System.Reactive.Linq;
+using WalletWasabi.Gui.Helpers;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Shell.Commands
 {
@@ -27,7 +29,8 @@ namespace WalletWasabi.Gui.Shell.Commands
 				.Merge(onOpenLogFile.ThrownExceptions)
 				.Merge(onOpenTorLogFile.ThrownExceptions)
 				.Merge(onOpenConfigFile.ThrownExceptions)
-				.Subscribe(OnFileOpenException);
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 
 			OpenDataFolderCommand = new CommandDefinition(
 				"Data Folder",
@@ -67,22 +70,17 @@ namespace WalletWasabi.Gui.Shell.Commands
 
 		private void OnOpenLogFile()
 		{
-			IoHelpers.OpenFileInTextEditor(Logging.Logger.FilePath);
+			FileHelpers.OpenFileInTextEditor(Logger.FilePath);
 		}
 
 		private void OnOpenTorLogFile()
 		{
-			IoHelpers.OpenFileInTextEditor(Global.TorLogsFile);
+			FileHelpers.OpenFileInTextEditor(Global.TorLogsFile);
 		}
 
 		private void OnOpenConfigFile()
 		{
-			IoHelpers.OpenFileInTextEditor(Global.Config.FilePath);
-		}
-
-		private void OnFileOpenException(Exception ex)
-		{
-			Logging.Logger.LogError<DiskCommands>(ex);
+			FileHelpers.OpenFileInTextEditor(Global.Config.FilePath);
 		}
 
 		[ExportCommandDefinition("File.Open.DataFolder")]

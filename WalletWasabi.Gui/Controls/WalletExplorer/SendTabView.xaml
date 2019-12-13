@@ -1,6 +1,6 @@
-﻿<UserControl xmlns="https://github.com/avaloniaui" 
+﻿<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:controls="clr-namespace:WalletWasabi.Gui.Controls;assembly=WalletWasabi.Gui"             
+             xmlns:controls="clr-namespace:WalletWasabi.Gui.Controls;assembly=WalletWasabi.Gui"
              xmlns:i="clr-namespace:Avalonia.Xaml.Interactivity;assembly=Avalonia.Xaml.Interactivity"
              xmlns:iac="clr-namespace:Avalonia.Xaml.Interactions.Custom;assembly=Avalonia.Xaml.Interactions.Custom"
              xmlns:converters="clr-namespace:WalletWasabi.Gui.Converters;assembly=WalletWasabi.Gui"
@@ -27,40 +27,21 @@
         <Setter Property="Padding" Value="0 0 5 0" />
       </Style>
       <Style Selector="TextBox">
-        <Setter Property="FontSize" Value="{DynamicResource FontSizeNormal}"/>
+        <Setter Property="FontSize" Value="{DynamicResource FontSizeNormal}" />
       </Style>
     </DockPanel.Styles>
     <Grid Classes="content">
       <DockPanel LastChildFill="True" Margin="20">
         <StackPanel DockPanel.Dock="Bottom" Margin="0 10" Spacing="10" HorizontalAlignment="Left">
-          <TextBlock>You must select coins you want to spend from.</TextBlock>
+          <TextBlock>Select coins you want to spend.</TextBlock>
           <controls:ExtendedTextBox Classes="monospaceFont" Text="{Binding Address}" Watermark="Address" UseFloatingWatermark="True">
             <i:Interaction.Behaviors>
               <behaviors:PasteAddressOnClickBehavior Command="{Binding OnAddressPasteCommand}" />
             </i:Interaction.Behaviors>
           </controls:ExtendedTextBox>
-          <StackPanel Spacing="8">
-            <controls:ExtendedTextBox x:Name="LabelTextBox" Text="{Binding Label}" Watermark="Label" UseFloatingWatermark="True" IsReadOnly="{Binding IsMax}" ToolTip.Tip="{Binding LabelToolTip}" CaretIndex="{Binding CaretIndex}">
-              <i:Interaction.Behaviors>
-                <behaviors:SuggestionBehavior SuggestionItems="{Binding Suggestions}" />
-                <behaviors:CommandOnEnterBehavior Command="{Binding GenerateCommand}" />
-                <behaviors:FocusBehavior IsFocused="{Binding IsSelected}" />
-                <iac:FocusOnAttachedToVisualTreeBehavior />
-              </i:Interaction.Behaviors>
-            </controls:ExtendedTextBox>
-            <ItemsControl Items="{Binding Suggestions}">
-              <ItemsControl.ItemsPanel>
-                <ItemsPanelTemplate>
-                  <StackPanel Orientation="Horizontal" Spacing="2" />
-                </ItemsPanelTemplate>
-              </ItemsControl.ItemsPanel>
-              <ItemsControl.ItemTemplate>
-                <DataTemplate>
-                  <Button Focusable="False" Content="{Binding Word}" Command="{Binding OnSelected}" IsPressed="{Binding IsHighLighted}" />
-                </DataTemplate>
-              </ItemsControl.ItemTemplate>
-            </ItemsControl>
-          </StackPanel>
+
+          <controls:SuggestLabelView DataContext="{Binding LabelSuggestion}" />
+
           <StackPanel Orientation="Horizontal" Spacing="10">
             <Button Content="{Binding IsMax, Converter={StaticResource BooleanStringConverter}, ConverterParameter=Clear:Max}" Command="{Binding MaxCommand}" VerticalAlignment="Top" Height="40" />
             <controls:ExtendedTextBox
@@ -71,7 +52,11 @@
               Watermark="{Binding AmountWatermarkText}"
               UseFloatingWatermark="True"
               MinWidth="124"
-              MinHeight="46" />
+              MinHeight="46">
+              <i:Interaction.Behaviors>
+                <behaviors:CommandOnKeyUpBehavior Command="{Binding AmountKeyUpCommand}" />
+              </i:Interaction.Behaviors>
+            </controls:ExtendedTextBox>
             <StackPanel Opacity="{Binding FeeControlOpacity}">
               <StackPanel IsVisible="{Binding !MinMaxFeeTargetsEqual}" Orientation="Horizontal" Spacing="10">
                 <TextBlock Text="Fee:" />
@@ -102,7 +87,7 @@
             </StackPanel>
             <StackPanel IsVisible="{Binding IsCustomFee}" VerticalAlignment="Center" Orientation="Horizontal" Spacing="10">
               <TextBlock Text="or set Fee:" />
-              <controls:ExtendedTextBox Text="{Binding UserFeeText, Mode=TwoWay}" Watermark="Fee (sat/byte)" UseFloatingWatermark="True" MinWidth="124" MaxWidth="124" MinHeight="46">
+              <controls:ExtendedTextBox Text="{Binding UserFeeText, Mode=TwoWay}" Watermark="Fee (sat/vByte)" UseFloatingWatermark="True" MinWidth="124" MaxWidth="124" MinHeight="46">
                 <i:Interaction.Behaviors>
                   <behaviors:CommandOnKeyUpBehavior Command="{Binding UserFeeTextKeyUpCommand}" />
                 </i:Interaction.Behaviors>
@@ -110,11 +95,11 @@
             </StackPanel>
           </StackPanel>
           <StackPanel Spacing="10" Orientation="Horizontal">
-            <controls:NoparaPasswordBox Password="{Binding Password}" IsVisible="{Binding !IsWatchOnly}" Watermark="Password" UseFloatingWatermark="True" MinWidth="173" MaxWidth="173">
+            <controls:TogglePasswordBox Text="{Binding Password}" IsVisible="{Binding !IsWatchOnly}" MaxWidth = "600">
               <i:Interaction.Behaviors>
                 <behaviors:CommandOnEnterBehavior Command="{Binding BuildTransactionCommand}" />
               </i:Interaction.Behaviors>
-            </controls:NoparaPasswordBox>
+            </controls:TogglePasswordBox>
             <DockPanel VerticalAlignment="Top" LastChildFill="True">
               <Button Command="{Binding BuildTransactionCommand}" DockPanel.Dock="Right">
                 <StackPanel Orientation="Horizontal">
@@ -125,11 +110,9 @@
               <Grid></Grid>
             </DockPanel>
           </StackPanel>
-          <TextBlock Text="{Binding WarningMessage}" Classes="warningMessage" />
-          <TextBlock Text="{Binding SuccessMessage}" Classes="validationMessage" Foreground="Green" />
           <Grid ColumnDefinitions="60,100,100,600,100,Auto"></Grid>
         </StackPanel>
-        <local:CoinListView DataContext="{Binding CoinList}" />
+        <local:CoinListView SelectAllNonPrivateVisible="False" DataContext="{Binding CoinList}" />
       </DockPanel>
     </Grid>
   </DockPanel>

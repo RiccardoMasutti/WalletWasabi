@@ -2,8 +2,9 @@ using NBitcoin;
 using System;
 using System.IO;
 using System.Security;
+using WalletWasabi.Blockchain.Analysis.Clustering;
+using WalletWasabi.Blockchain.Keys;
 using WalletWasabi.Helpers;
-using WalletWasabi.KeyManagement;
 using WalletWasabi.Logging;
 using WalletWasabi.Tests.XunitConfiguration;
 using Xunit;
@@ -89,7 +90,7 @@ namespace WalletWasabi.Tests.UnitTests
 		{
 			string password = "password";
 
-			var filePath = Path.Combine(Global.Instance.DataDir, EnvironmentHelpers.GetMethodName(), "Wallet.json");
+			var filePath = Path.Combine(Global.Instance.DataDir, EnvironmentHelpers.GetCallerFileName(), EnvironmentHelpers.GetMethodName(), "Wallet.json");
 			DeleteFileAndDirectoryIfExists(filePath);
 
 			Logger.TurnOff();
@@ -133,10 +134,10 @@ namespace WalletWasabi.Tests.UnitTests
 
 			var random = new Random();
 
-			var k1 = manager.GenerateNewKey("", KeyState.Clean, true);
+			var k1 = manager.GenerateNewKey(SmartLabel.Empty, KeyState.Clean, true);
 			var k2 = manager.GenerateNewKey(null, KeyState.Clean, true);
-			Assert.Equal("", k1.Label);
-			Assert.Equal("", k2.Label);
+			Assert.Equal(SmartLabel.Empty, k1.Label);
+			Assert.Equal(SmartLabel.Empty, k2.Label);
 
 			for (int i = 0; i < 1000; i++)
 			{
@@ -148,7 +149,7 @@ namespace WalletWasabi.Tests.UnitTests
 				Assert.Equal(isInternal, generatedKey.IsInternal);
 				Assert.Equal(label, generatedKey.Label);
 				Assert.Equal(keyState, generatedKey.KeyState);
-				Assert.StartsWith("84'/0'/0'", generatedKey.FullKeyPath.ToString());
+				Assert.StartsWith(KeyManager.DefaultAccountKeyPath.ToString(), generatedKey.FullKeyPath.ToString());
 			}
 		}
 

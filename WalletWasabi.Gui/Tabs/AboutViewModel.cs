@@ -8,6 +8,9 @@ using WalletWasabi.Gui.ViewModels;
 using System.IO;
 using ReactiveUI;
 using System.Reactive;
+using WalletWasabi.Helpers;
+using WalletWasabi.Logging;
+using System.Reactive.Linq;
 
 namespace WalletWasabi.Gui.Tabs
 {
@@ -17,24 +20,17 @@ namespace WalletWasabi.Gui.Tabs
 
 		public AboutViewModel(Global global) : base(global, "About")
 		{
-			Version = WalletWasabi.Helpers.Constants.ClientVersion;
+			OpenBrowserCommand = ReactiveCommand.Create<string>(x => IoHelpers.OpenBrowser(x));
 
-			OpenBrowserCommand = ReactiveCommand.Create<string>(x =>
-			{
-				try
-				{
-					IoHelpers.OpenBrowser(x);
-				}
-				catch (Exception ex)
-				{
-					Logging.Logger.LogError<AboutViewModel>(ex);
-				}
-			});
+			OpenBrowserCommand.ThrownExceptions
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 		}
 
-		public Version Version { get; }
-
-		public string VersionText => $"v{Version.ToVersionString()}";
+		public Version ClientVersion => Constants.ClientVersion;
+		public string BackendMajorVersion => Constants.BackendMajorVersion;
+		public Version BitcoinCoreVersion => Constants.BitcoinCoreVersion;
+		public Version HwiVersion => Constants.HwiVersion;
 
 		public string ClearnetLink => "https://wasabiwallet.io/";
 
@@ -42,7 +38,7 @@ namespace WalletWasabi.Gui.Tabs
 
 		public string SourceCodeLink => "https://github.com/zkSNACKs/WalletWasabi/";
 
-		public string StatusPageLink => "https://stats.uptimerobot.com/W7q65in4y";
+		public string StatusPageLink => "https://stats.uptimerobot.com/YQqGyUL8A7";
 
 		public string CustomerSupportLink => "https://www.reddit.com/r/WasabiWallet/";
 

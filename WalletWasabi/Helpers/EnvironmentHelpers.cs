@@ -125,10 +125,38 @@ namespace WalletWasabi.Helpers
 			}
 			catch (Exception ex)
 			{
-				Logger.LogDebug(ex, nameof(EnvironmentHelpers));
+				Logger.LogDebug(ex);
 			}
 
 			return directory;
+		}
+
+		// This method removes the path and file extension.
+		//
+		// Given Wasabi releases are currently built using Windows, the generated assemblies contain
+		// the hardcoded "C:\Users\User\Desktop\WalletWasabi\.......\FileName.cs" string because that
+		// is the real path of the file, it doesn't matter what OS was targeted.
+		// In Windows and Linux that string is a valid path and that means Path.GetFileNameWithoutExtension
+		// can extract the file name but in the case of OSX the same string is not a valid path so, it assumes
+		// the whole string is the file name.
+		public static string ExtractFileName(string callerFilePath)
+		{
+			var lastSeparatorIndex = callerFilePath.LastIndexOf("\\");
+			if (lastSeparatorIndex == -1)
+			{
+				lastSeparatorIndex = callerFilePath.LastIndexOf("/");
+			}
+
+			var fileName = callerFilePath;
+
+			if (lastSeparatorIndex != -1)
+			{
+				lastSeparatorIndex++;
+				fileName = callerFilePath[lastSeparatorIndex..]; // From lastSeparatorIndex until the end of the string.
+			}
+
+			var fileNameWithoutExtension = fileName.TrimEnd(".cs", StringComparison.InvariantCultureIgnoreCase);
+			return fileNameWithoutExtension;
 		}
 
 		/// <summary>
@@ -140,7 +168,7 @@ namespace WalletWasabi.Helpers
 		{
 			var escapedArgs = cmd.Replace("\"", "\\\"");
 
-			using (var process = Process.Start(
+			using var process = Process.Start(
 				new ProcessStartInfo
 				{
 					FileName = "/bin/sh",
@@ -150,15 +178,13 @@ namespace WalletWasabi.Helpers
 					CreateNoWindow = true,
 					WindowStyle = ProcessWindowStyle.Hidden
 				}
-			))
+			);
+			if (waitForExit)
 			{
-				if (waitForExit)
+				process.WaitForExit();
+				if (process.ExitCode != 0)
 				{
-					process.WaitForExit();
-					if (process.ExitCode != 0)
-					{
-						Logger.LogError($"{nameof(ShellExec)} command: {cmd} exited with exit code: {process.ExitCode}, instead of 0.", nameof(EnvironmentHelpers));
-					}
+					Logger.LogError($"{nameof(ShellExec)} command: {cmd} exited with exit code: {process.ExitCode}, instead of 0.");
 				}
 			}
 		}
@@ -194,6 +220,26 @@ namespace WalletWasabi.Helpers
 		public static string GetMethodName([CallerMemberName] string callerName = "")
 		{
 			return callerName;
+		}
+
+		public static string GetCallerFileName([CallerFilePath] string callerFilePath = "")
+		{
+			return ExtractFileName(callerFilePath);
+		}
+
+		public static string GetFullBaseDirectory()
+		{
+			var fullBaseDirectory = Path.GetFullPath(AppContext.BaseDirectory);
+
+			if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+			{
+				if (!fullBaseDirectory.StartsWith('/'))
+				{
+					fullBaseDirectory = fullBaseDirectory.Insert(0, "/");
+				}
+			}
+
+			return fullBaseDirectory;
 		}
 	}
 }

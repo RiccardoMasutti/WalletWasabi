@@ -11,6 +11,7 @@ using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using WalletWasabi.Gui.Tabs;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Shell.Commands
 {
@@ -25,82 +26,69 @@ namespace WalletWasabi.Gui.Shell.Commands
 			AboutCommand = new CommandDefinition(
 				"About",
 				commandIconService.GetCompletionKindImage("About"),
-				ReactiveCommand.Create(() =>
-				{
-					IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
-				}));
+				ReactiveCommand.Create(() => IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global))));
 
 			CustomerSupportCommand = new CommandDefinition(
 				"Customer Support",
 				commandIconService.GetCompletionKindImage("CustomerSupport"),
 				ReactiveCommand.Create(() =>
-				{
-					try
 					{
-						IoHelpers.OpenBrowser("https://www.reddit.com/r/WasabiWallet/");
-					}
-					catch (Exception ex)
-					{
-						Logging.Logger.LogWarning<HelpCommands>(ex);
-						IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
-					}
-				}));
+						try
+						{
+							IoHelpers.OpenBrowser("https://www.reddit.com/r/WasabiWallet/");
+						}
+						catch (Exception ex)
+						{
+							Logger.LogWarning(ex);
+							IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
+						}
+					}));
 
 			ReportBugCommand = new CommandDefinition(
 				"Report Bug",
 				commandIconService.GetCompletionKindImage("ReportBug"),
 				ReactiveCommand.Create(() =>
-				{
-					try
 					{
-						IoHelpers.OpenBrowser("https://github.com/zkSNACKs/WalletWasabi/issues");
-					}
-					catch (Exception ex)
-					{
-						Logging.Logger.LogWarning<HelpCommands>(ex);
-						IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
-					}
-				}));
+						try
+						{
+							IoHelpers.OpenBrowser("https://github.com/zkSNACKs/WalletWasabi/issues");
+						}
+						catch (Exception ex)
+						{
+							Logger.LogWarning(ex);
+							IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
+						}
+					}));
 
 			DocsCommand = new CommandDefinition(
 				"Documentation",
 				commandIconService.GetCompletionKindImage("Documentation"),
 				ReactiveCommand.Create(() =>
-				{
-					try
 					{
-						IoHelpers.OpenBrowser("https://docs.wasabiwallet.io/");
-					}
-					catch (Exception ex)
-					{
-						Logging.Logger.LogWarning<HelpCommands>(ex);
-						IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
-					}
-				}));
+						try
+						{
+							IoHelpers.OpenBrowser("https://docs.wasabiwallet.io/");
+						}
+						catch (Exception ex)
+						{
+							Logger.LogWarning(ex);
+							IoC.Get<IShell>().AddOrSelectDocument(() => new AboutViewModel(Global));
+						}
+					}));
 
-			PrivacyPolicyCommand = new CommandDefinition(
-				"Privacy Policy",
-				commandIconService.GetCompletionKindImage("PrivacyPolicy"),
-				ReactiveCommand.Create(() =>
-				{
-					IoC.Get<IShell>().AddOrSelectDocument(() => new PrivacyPolicyViewModel(Global));
-				}));
+			LegalDocumentsCommand = new CommandDefinition(
+				"Legal Documents",
+				commandIconService.GetCompletionKindImage("LegalDocuments"),
+				ReactiveCommand.Create(() => IoC.Get<IShell>().AddOrSelectDocument(() => new LegalDocumentsViewModel(Global))));
 
-			TermsAndConditionsCommand = new CommandDefinition(
-				"Terms and Conditions",
-				commandIconService.GetCompletionKindImage("TermsAndConditions"),
-				ReactiveCommand.Create(() =>
-				{
-					IoC.Get<IShell>().AddOrSelectDocument(() => new TermsAndConditionsViewModel(Global));
-				}));
-
-			LegalIssuesCommand = new CommandDefinition(
-				"Legal Issues",
-				commandIconService.GetCompletionKindImage("LegalIssues"),
-				ReactiveCommand.Create(() =>
-				{
-					IoC.Get<IShell>().AddOrSelectDocument(() => new LegalIssuesViewModel(Global));
-				}));
+			Observable
+				.Merge(AboutCommand.GetReactiveCommand().ThrownExceptions)
+				.Merge(CustomerSupportCommand.GetReactiveCommand().ThrownExceptions)
+				.Merge(ReportBugCommand.GetReactiveCommand().ThrownExceptions)
+				.Merge(DocsCommand.GetReactiveCommand().ThrownExceptions)
+				.Merge(LegalDocumentsCommand.GetReactiveCommand().ThrownExceptions)
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 		}
 
 		[ExportCommandDefinition("Help.About")]
@@ -115,13 +103,7 @@ namespace WalletWasabi.Gui.Shell.Commands
 		[ExportCommandDefinition("Help.Documentation")]
 		public CommandDefinition DocsCommand { get; }
 
-		[ExportCommandDefinition("Help.PrivacyPolicy")]
-		public CommandDefinition PrivacyPolicyCommand { get; }
-
-		[ExportCommandDefinition("Help.TermsAndConditions")]
-		public CommandDefinition TermsAndConditionsCommand { get; }
-
-		[ExportCommandDefinition("Help.LegalIssues")]
-		public CommandDefinition LegalIssuesCommand { get; }
+		[ExportCommandDefinition("Help.LegalDocuments")]
+		public CommandDefinition LegalDocumentsCommand { get; }
 	}
 }

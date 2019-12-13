@@ -5,9 +5,12 @@ using System;
 using System.Linq;
 using System.Reactive;
 using System.Reactive.Disposables;
+using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using WalletWasabi.Models;
+using WalletWasabi.Blockchain.TransactionOutputs;
+using WalletWasabi.CoinJoin.Client.Clients.Queuing;
+using WalletWasabi.Logging;
 
 namespace WalletWasabi.Gui.Dialogs
 {
@@ -63,7 +66,8 @@ namespace WalletWasabi.Gui.Dialogs
 				}
 				// OK pressed.
 				Close(false);
-			}, canOk);
+			},
+			canOk);
 
 			CancelCommand = ReactiveCommand.CreateFromTask(async () =>
 			{
@@ -78,8 +82,11 @@ namespace WalletWasabi.Gui.Dialogs
 			},
 			canCancel);
 
-			OKCommand.ThrownExceptions.Subscribe(Logging.Logger.LogWarning<CannotCloseDialogViewModel>);
-			CancelCommand.ThrownExceptions.Subscribe(Logging.Logger.LogWarning<CannotCloseDialogViewModel>);
+			Observable
+				.Merge(OKCommand.ThrownExceptions)
+				.Merge(CancelCommand.ThrownExceptions)
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex => Logger.LogError(ex));
 		}
 
 		public override void OnOpen()
@@ -134,7 +141,7 @@ namespace WalletWasabi.Gui.Dialogs
 							return;
 						}
 
-						SmartCoin[] enqueuedCoins = Global.WalletService.Coins.Where(x => x.CoinJoinInProgress).ToArray();
+						SmartCoin[] enqueuedCoins = Global.WalletService.Coins.CoinJoinInProcess().ToArray();
 						Exception latestException = null;
 						foreach (var coin in enqueuedCoins)
 						{
@@ -145,7 +152,7 @@ namespace WalletWasabi.Gui.Dialogs
 									break;
 								}
 
-								await Global.ChaumianClient.DequeueCoinsFromMixAsync(new SmartCoin[] { coin }, "Closing Wasabi."); // Dequeue coins one-by-one to check cancel flag more frequently.
+								await Global.ChaumianClient.DequeueCoinsFromMixAsync(new SmartCoin[] { coin }, DequeueReason.ApplicationExit); // Dequeue coins one-by-one to check cancel flag more frequently.
 							}
 							catch (Exception ex)
 							{
@@ -201,7 +208,7 @@ namespace WalletWasabi.Gui.Dialogs
 				}
 				catch (TaskCanceledException ex)
 				{
-					Logging.Logger.LogTrace<CannotCloseDialogViewModel>(ex);
+					Logger.LogTrace(ex);
 				}
 
 				if (WarningMessage == message)

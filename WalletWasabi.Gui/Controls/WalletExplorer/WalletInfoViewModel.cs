@@ -7,9 +7,12 @@ using System.Reactive;
 using System.Reactive.Disposables;
 using System.Threading;
 using System.Threading.Tasks;
+using WalletWasabi.Gui.ViewModels.Validation;
 using WalletWasabi.Helpers;
-using WalletWasabi.KeyManagement;
 using WalletWasabi.Services;
+using WalletWasabi.Models;
+using WalletWasabi.Gui.Helpers;
+using System.Reactive.Linq;
 
 namespace WalletWasabi.Gui.Controls.WalletExplorer
 {
@@ -27,30 +30,8 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 		public WalletInfoViewModel(WalletViewModel walletViewModel) : base(walletViewModel.Name, walletViewModel)
 		{
 			ClearSensitiveData(true);
-			SetWarningMessage("");
-
-			this.WhenAnyValue(x => x.Password).Subscribe(x =>
-			{
-				try
-				{
-					if (x.NotNullAndNotEmpty())
-					{
-						char lastChar = x.Last();
-						if (lastChar == '\r' || lastChar == '\n') // If the last character is cr or lf then act like it'd be a sign to do the job.
-						{
-							Password = x.TrimEnd('\r', '\n');
-						}
-					}
-				}
-				catch (Exception ex)
-				{
-					Logging.Logger.LogTrace(ex);
-				}
-			});
 
 			ToggleSensitiveKeysCommand = ReactiveCommand.Create(() =>
-			{
-				try
 				{
 					if (ShowSensitiveKeys)
 					{
@@ -63,7 +44,7 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 
 						if (isCompatibilityPasswordUsed != null)
 						{
-							SetWarningMessage(PasswordHelper.CompatibilityPasswordWarnMessage);
+							NotificationHelpers.Warning(PasswordHelper.CompatibilityPasswordWarnMessage);
 						}
 
 						string master = secret.GetWif(Global.Network).ToWif();
@@ -72,12 +53,15 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 						string accountZ = secret.Derive(KeyManager.AccountKeyPath).ToZPrv(Global.Network);
 						SetSensitiveData(master, account, masterZ, accountZ);
 					}
-				}
-				catch (Exception ex)
+				});
+
+			ToggleSensitiveKeysCommand.ThrownExceptions
+				.ObserveOn(RxApp.TaskpoolScheduler)
+				.Subscribe(ex =>
 				{
-					SetWarningMessage(ex.ToTypeMessageString());
-				}
-			});
+					Logging.Logger.LogError(ex);
+					NotificationHelpers.Error(ex.ToUserFriendlyString());
+				});
 		}
 
 		private void ClearSensitiveData(bool passwordToo)
@@ -108,6 +92,9 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 			set => this.RaiseAndSetIfChanged(ref _showSensitiveKeys, value);
 		}
 
+		public ErrorDescriptors ValidatePassword() => PasswordHelper.ValidatePassword(Password);
+
+		[ValidateMethod(nameof(ValidatePassword))]
 		public string Password
 		{
 			get => _password;
@@ -147,20 +134,20 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 			ShowSensitiveKeys = true;
 
 			Dispatcher.UIThread.PostLogException(async () =>
-			{
-				try
 				{
-					await Task.Delay(21000, Closing.Token);
-				}
-				catch (TaskCanceledException)
-				{
-					// Ignore
-				}
-				finally
-				{
-					ClearSensitiveData(false);
-				}
-			});
+					try
+					{
+						await Task.Delay(21000, Closing.Token);
+					}
+					catch (TaskCanceledException)
+					{
+						// Ignore
+					}
+					finally
+					{
+						ClearSensitiveData(false);
+					}
+				});
 		}
 
 		public override void OnOpen()
@@ -170,10 +157,10 @@ namespace WalletWasabi.Gui.Controls.WalletExplorer
 			Closing = new CancellationTokenSource();
 
 			Global.UiConfig.WhenAnyValue(x => x.LurkingWifeMode).Subscribe(_ =>
-			{
-				this.RaisePropertyChanged(nameof(ExtendedAccountPublicKey));
-				this.RaisePropertyChanged(nameof(ExtendedAccountZpub));
-			}).DisposeWith(Disposables);
+				{
+					this.RaisePropertyChanged(nameof(ExtendedAccountPublicKey));
+					this.RaisePropertyChanged(nameof(ExtendedAccountZpub));
+				}).DisposeWith(Disposables);
 
 			Closing.DisposeWith(Disposables);
 

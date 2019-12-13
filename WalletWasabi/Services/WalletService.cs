@@ -1,67 +1,49 @@
 using NBitcoin;
-using NBitcoin.BitcoinCore;
 using NBitcoin.DataEncoders;
-using NBitcoin.Policy;
 using NBitcoin.Protocol;
 using NBitcoin.Protocol.Behaviors;
-using Newtonsoft.Json;
+using NBitcoin.RPC;
 using Nito.AsyncEx;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using WalletWasabi.Backend.Models;
+using WalletWasabi.BitcoinCore;
+using WalletWasabi.Blockchain.Analysis.Clustering;
+using WalletWasabi.Blockchain.Analysis.FeesEstimation;
+using WalletWasabi.Blockchain.Keys;
+using WalletWasabi.Blockchain.TransactionBuilding;
+using WalletWasabi.Blockchain.TransactionOutputs;
+using WalletWasabi.Blockchain.TransactionProcessing;
+using WalletWasabi.Blockchain.Transactions;
+using WalletWasabi.CoinJoin.Client.Clients;
 using WalletWasabi.Exceptions;
 using WalletWasabi.Helpers;
-using WalletWasabi.KeyManagement;
 using WalletWasabi.Logging;
 using WalletWasabi.Models;
-using WalletWasabi.Models.TransactionBuilding;
 using WalletWasabi.Stores;
 using WalletWasabi.WebClients.Wasabi;
 
 namespace WalletWasabi.Services
 {
-	public class WalletService
+	public class WalletService : IDisposable
 	{
 		public static event EventHandler<bool> DownloadingBlockChanged;
 
-		// So we will make sure when blocks are downloading with multiple wallet services, they do not conflict.
-		private static AsyncLock BlockDownloadLock { get; } = new AsyncLock();
-
-		private static bool DownloadingBlockBacking;
-
-		public static bool DownloadingBlock
-		{
-			get => DownloadingBlockBacking;
-			set
-			{
-				if (value != DownloadingBlockBacking)
-				{
-					DownloadingBlockBacking = value;
-					DownloadingBlockChanged?.Invoke(null, value);
-				}
-			}
-		}
+		public static event EventHandler<bool> InitializingChanged;
 
 		public BitcoinStore BitcoinStore { get; }
 		public KeyManager KeyManager { get; }
 		public WasabiSynchronizer Synchronizer { get; }
-		public CcjClient ChaumianClient { get; }
-		public MempoolService Mempool { get; }
+		public CoinJoinClient ChaumianClient { get; }
 		public NodesGroup Nodes { get; }
 		public string BlocksFolderPath { get; }
-		public string TransactionsFolderPath { get; }
-		public string TransactionsFilePath { get; }
 
 		private AsyncLock HandleFiltersLock { get; }
 
@@ -71,9 +53,10 @@ namespace WalletWasabi.Services
 
 		public ServiceConfiguration ServiceConfiguration { get; }
 
-		public ConcurrentDictionary<uint256, (Height height, DateTimeOffset dateTime)> ProcessedBlocks { get; }
-
-		public ObservableConcurrentHashSet<SmartCoin> Coins { get; }
+		/// <summary>
+		/// Unspent Transaction Outputs
+		/// </summary>
+		public ICoinsView Coins { get; }
 
 		public event EventHandler<FilterModel> NewFilterProcessed;
 
@@ -83,33 +66,29 @@ namespace WalletWasabi.Services
 
 		public TransactionProcessor TransactionProcessor { get; }
 
-		private ConcurrentHashSet<SmartTransaction> TransactionCache { get; }
-
 		public WalletService(
 			BitcoinStore bitcoinStore,
 			KeyManager keyManager,
 			WasabiSynchronizer syncer,
-			CcjClient chaumianClient,
-			MempoolService mempool,
+			CoinJoinClient chaumianClient,
 			NodesGroup nodes,
 			string workFolderDir,
-			ServiceConfiguration serviceConfiguration)
+			ServiceConfiguration serviceConfiguration,
+			IFeeProvider feeProvider,
+			CoreNode coreNode = null)
 		{
 			BitcoinStore = Guard.NotNull(nameof(bitcoinStore), bitcoinStore);
 			KeyManager = Guard.NotNull(nameof(keyManager), keyManager);
 			Nodes = Guard.NotNull(nameof(nodes), nodes);
 			Synchronizer = Guard.NotNull(nameof(syncer), syncer);
 			ChaumianClient = Guard.NotNull(nameof(chaumianClient), chaumianClient);
-			Mempool = Guard.NotNull(nameof(mempool), mempool);
 			ServiceConfiguration = Guard.NotNull(nameof(serviceConfiguration), serviceConfiguration);
+			FeeProvider = Guard.NotNull(nameof(feeProvider), feeProvider);
+			CoreNode = coreNode;
 
-			ProcessedBlocks = new ConcurrentDictionary<uint256, (Height height, DateTimeOffset dateTime)>();
 			HandleFiltersLock = new AsyncLock();
 
-			Coins = new ObservableConcurrentHashSet<SmartCoin>();
-
 			BlocksFolderPath = Path.Combine(workFolderDir, "Blocks", Network.ToString());
-			TransactionsFolderPath = Path.Combine(workFolderDir, "Transactions", Network.ToString());
 			RuntimeParams.SetDataDir(workFolderDir);
 
 			BlockFolderLock = new AsyncLock();
@@ -117,11 +96,10 @@ namespace WalletWasabi.Services
 			KeyManager.AssertCleanKeysIndexed();
 			KeyManager.AssertLockedInternalKeysIndexed(14);
 
-			TransactionCache = new ConcurrentHashSet<SmartTransaction>();
+			TransactionProcessor = new TransactionProcessor(BitcoinStore.TransactionStore, KeyManager, ServiceConfiguration.DustThreshold, ServiceConfiguration.PrivacyLevelStrong);
+			Coins = TransactionProcessor.Coins;
 
-			TransactionProcessor = new TransactionProcessor(KeyManager, Mempool.TransactionHashes, Coins, ServiceConfiguration.DustThreshold, TransactionCache);
-			TransactionProcessor.CoinSpent += TransactionProcessor_CoinSpent;
-			TransactionProcessor.CoinReceived += TransactionProcessor_CoinReceivedAsync;
+			TransactionProcessor.WalletRelevantTransactionProcessed += TransactionProcessor_WalletRelevantTransactionProcessedAsync;
 
 			if (Directory.Exists(BlocksFolderPath))
 			{
@@ -136,97 +114,68 @@ namespace WalletWasabi.Services
 				Directory.CreateDirectory(BlocksFolderPath);
 			}
 
-			if (Directory.Exists(TransactionsFolderPath))
-			{
-				if (Synchronizer.Network == Network.RegTest)
-				{
-					Directory.Delete(TransactionsFolderPath, true);
-					Directory.CreateDirectory(TransactionsFolderPath);
-				}
-			}
-			else
-			{
-				Directory.CreateDirectory(TransactionsFolderPath);
-			}
-
 			var walletName = "UnnamedWallet";
 			if (!string.IsNullOrWhiteSpace(KeyManager.FilePath))
 			{
 				walletName = Path.GetFileNameWithoutExtension(KeyManager.FilePath);
 			}
-			TransactionsFilePath = Path.Combine(TransactionsFolderPath, $"{walletName}Transactions.json");
 
 			BitcoinStore.IndexStore.NewFilter += IndexDownloader_NewFilterAsync;
 			BitcoinStore.IndexStore.Reorged += IndexDownloader_ReorgedAsync;
-			Mempool.TransactionReceived += Mempool_TransactionReceivedAsync;
+			BitcoinStore.MempoolService.TransactionReceived += Mempool_TransactionReceived;
 		}
 
-		private void TransactionProcessor_CoinSpent(object sender, SmartCoin spentCoin)
-		{
-			ChaumianClient.ExposedLinks.TryRemove(spentCoin.GetTxoRef(), out _);
-		}
-
-		private async void TransactionProcessor_CoinReceivedAsync(object sender, SmartCoin newCoin)
-		{
-			// If it's being mixed and anonset is not sufficient, then queue it.
-			if (newCoin.Unspent && ChaumianClient.HasIngredients
-				&& newCoin.AnonymitySet < ServiceConfiguration.MixUntilAnonymitySet
-				&& ChaumianClient.State.Contains(newCoin.SpentOutputs))
-			{
-				try
-				{
-					await ChaumianClient.QueueCoinsToMixAsync(newCoin);
-				}
-				catch (Exception ex)
-				{
-					Logger.LogError<WalletService>(ex);
-				}
-			}
-		}
-
-		private void Coins_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
-		{
-			if (e.Action == NotifyCollectionChangedAction.Remove)
-			{
-				foreach (var toRemove in e.OldItems.Cast<SmartCoin>())
-				{
-					if (toRemove.SpenderTransactionId != null)
-					{
-						foreach (var toAlsoRemove in Coins.Where(x => x.TransactionId == toRemove.SpenderTransactionId).Distinct().ToList())
-						{
-							Coins.TryRemove(toAlsoRemove);
-						}
-					}
-
-					Mempool.TransactionHashes.TryRemove(toRemove.TransactionId);
-					var txToRemove = TryGetTxFromCache(toRemove.TransactionId);
-					if (txToRemove != default(SmartTransaction))
-					{
-						TransactionCache.TryRemove(txToRemove);
-					}
-				}
-			}
-
-			RefreshCoinHistories();
-		}
-
-		private static AsyncLock TransactionProcessingLock { get; } = new AsyncLock();
-
-		private async void Mempool_TransactionReceivedAsync(object sender, SmartTransaction tx)
+		private async void TransactionProcessor_WalletRelevantTransactionProcessedAsync(object sender, ProcessedResult e)
 		{
 			try
 			{
-				using (await TransactionProcessingLock.LockAsync())
+				foreach (var coin in e.NewlySpentCoins.Concat(e.ReplacedCoins).Concat(e.SuccessfullyDoubleSpentCoins).Distinct())
 				{
-					if (await ProcessTransactionAsync(tx))
+					ChaumianClient.ExposedLinks.TryRemove(coin.GetTxoRef(), out _);
+				}
+			}
+			catch (Exception ex)
+			{
+				Logger.LogError(ex);
+			}
+
+			try
+			{
+				IEnumerable<SmartCoin> newCoins = e.NewlyReceivedCoins.Concat(e.RestoredCoins).Distinct();
+				if (newCoins.Any())
+				{
+					if (ChaumianClient.State.Contains(e.Transaction.Transaction.Inputs.Select(x => x.PrevOut.ToTxoRef())))
 					{
-						SerializeTransactionCache();
+						var coinsToQueue = new HashSet<SmartCoin>();
+						foreach (var newCoin in newCoins)
+						{
+							// If it's being mixed and anonset is not sufficient, then queue it.
+							if (newCoin.Unspent && ChaumianClient.HasIngredients
+								&& newCoin.AnonymitySet < ServiceConfiguration.MixUntilAnonymitySet)
+							{
+								coinsToQueue.Add(newCoin);
+							}
+						}
+
+						await ChaumianClient.QueueCoinsToMixAsync(coinsToQueue).ConfigureAwait(false);
 					}
 				}
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning<WalletService>(ex);
+				Logger.LogError(ex);
+			}
+		}
+
+		private void Mempool_TransactionReceived(object sender, SmartTransaction tx)
+		{
+			try
+			{
+				TransactionProcessor.Process(tx);
+			}
+			catch (Exception ex)
+			{
+				Logger.LogWarning(ex);
 			}
 		}
 
@@ -236,22 +185,16 @@ namespace WalletWasabi.Services
 			{
 				using (await HandleFiltersLock.LockAsync())
 				{
-					uint256 invalidBlockHash = invalidFilter.BlockHash;
+					uint256 invalidBlockHash = invalidFilter.Header.BlockHash;
 					await DeleteBlockAsync(invalidBlockHash);
-					var blockState = KeyManager.TryRemoveBlockState(invalidBlockHash);
-					ProcessedBlocks.TryRemove(invalidBlockHash, out _);
-					if (blockState != null && blockState.BlockHeight != default(Height))
-					{
-						foreach (var toRemove in Coins.Where(x => x.Height == blockState.BlockHeight).Distinct().ToList())
-						{
-							Coins.TryRemove(toRemove);
-						}
-					}
+					KeyManager.SetMaxBestHeight(new Height(invalidFilter.Header.Height - 1));
+					TransactionProcessor.UndoBlock((int)invalidFilter.Header.Height);
+					BitcoinStore.TransactionStore.ReleaseToMempoolFromBlock(invalidBlockHash);
 				}
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning<WalletService>(ex);
+				Logger.LogWarning(ex);
 			}
 		}
 
@@ -261,7 +204,7 @@ namespace WalletWasabi.Services
 			{
 				using (await HandleFiltersLock.LockAsync())
 				{
-					if (filterModel.Filter != null && !KeyManager.CointainsBlockState(filterModel.BlockHash))
+					if (KeyManager.GetBestHeight() < filterModel.Header.Height)
 					{
 						await ProcessFilterModelAsync(filterModel, CancellationToken.None);
 					}
@@ -271,90 +214,63 @@ namespace WalletWasabi.Services
 				do
 				{
 					await Task.Delay(100);
-					if (Synchronizer is null || BitcoinStore?.HashChain is null)
+					if (Synchronizer is null || BitcoinStore?.SmartHeaderChain is null)
 					{
 						return;
 					}
 					// Make sure fully synced and this filter is the lastest filter.
-					if (BitcoinStore.HashChain.HashesLeft != 0 || BitcoinStore.HashChain.TipHash != filterModel.BlockHash)
+					if (BitcoinStore.SmartHeaderChain.HashesLeft != 0 || BitcoinStore.SmartHeaderChain.TipHash != filterModel.Header.BlockHash)
 					{
 						return;
 					}
 				} while (Synchronizer.AreRequestsBlocked()); // If requests are blocked, delay mempool cleanup, because coinjoin answers are always priority.
 
-				await Mempool?.TryPerformMempoolCleanupAsync(Synchronizer?.WasabiClient?.TorClient?.DestinationUriAction, Synchronizer?.WasabiClient?.TorClient?.TorSocks5EndPoint);
+				await BitcoinStore.MempoolService?.TryPerformMempoolCleanupAsync(Synchronizer?.WasabiClient?.TorClient?.DestinationUriAction, Synchronizer?.WasabiClient?.TorClient?.TorSocks5EndPoint);
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning<WalletService>(ex);
+				Logger.LogWarning(ex);
 			}
 		}
 
 		public async Task InitializeAsync(CancellationToken cancel)
 		{
-			if (!Synchronizer.IsRunning)
+			try
 			{
-				throw new NotSupportedException($"{nameof(Synchronizer)} is not running.");
-			}
+				InitializingChanged?.Invoke(null, true);
 
-			await RuntimeParams.LoadAsync();
-
-			using (await HandleFiltersLock.LockAsync())
-			{
-				var unconfirmedTransactions = new SmartTransaction[0];
-				var confirmedTransactions = new SmartTransaction[0];
-
-				// Fetch previous wallet state from transactions file
-				if (File.Exists(TransactionsFilePath))
+				if (!Synchronizer.IsRunning)
 				{
-					try
-					{
-						IEnumerable<SmartTransaction> transactions = null;
-						string jsonString = File.ReadAllText(TransactionsFilePath, Encoding.UTF8);
-						transactions = JsonConvert.DeserializeObject<IEnumerable<SmartTransaction>>(jsonString)?.OrderByBlockchain();
-
-						confirmedTransactions = transactions?.Where(x => x.Confirmed)?.ToArray() ?? new SmartTransaction[0];
-
-						unconfirmedTransactions = transactions?.Where(x => !x.Confirmed)?.ToArray() ?? new SmartTransaction[0];
-					}
-					catch (Exception ex)
-					{
-						Logger.LogWarning<WalletService>(ex);
-						Logger.LogWarning<WalletService>($"Transaction cache got corrupted. Deleting {TransactionsFilePath}.");
-						File.Delete(TransactionsFilePath);
-					}
+					throw new NotSupportedException($"{nameof(Synchronizer)} is not running.");
 				}
 
-				await LoadWalletStateAsync(confirmedTransactions, cancel);
+				while (!BitcoinStore.IsInitialized)
+				{
+					await Task.Delay(100).ConfigureAwait(false);
 
-				// Load in dummy mempool
-				try
-				{
-					if (unconfirmedTransactions != null && unconfirmedTransactions.Any())
-					{
-						await LoadDummyMempoolAsync(unconfirmedTransactions);
-					}
+					cancel.ThrowIfCancellationRequested();
 				}
-				finally
+
+				await RuntimeParams.LoadAsync();
+
+				using (await HandleFiltersLock.LockAsync())
 				{
-					UnconfirmedTransactionsInitialized = true;
+					await LoadWalletStateAsync(cancel);
+					await LoadDummyMempoolAsync();
 				}
 			}
-			Coins.CollectionChanged += Coins_CollectionChanged;
-			RefreshCoinHistories();
+			finally
+			{
+				InitializingChanged?.Invoke(null, false);
+			}
 		}
 
-		private async Task LoadWalletStateAsync(SmartTransaction[] confirmedTransactions, CancellationToken cancel)
+		private async Task LoadWalletStateAsync(CancellationToken cancel)
 		{
 			KeyManager.AssertNetworkOrClearBlockState(Network);
 			Height bestKeyManagerHeight = KeyManager.GetBestHeight();
 
-			foreach (BlockState blockState in KeyManager.GetTransactionIndex())
-			{
-				var relevantTransactions = confirmedTransactions.Where(x => x.BlockHash == blockState.BlockHash).ToArray();
-				var block = await FetchBlockAsync(blockState.BlockHash, cancel);
-				await ProcessBlockAsync(blockState.BlockHeight, block, blockState.TransactionIndices, relevantTransactions);
-			}
+			TransactionProcessor.Process(BitcoinStore.TransactionStore.ConfirmedStore.GetTransactions().TakeWhile(x => x.Height <= bestKeyManagerHeight));
 
 			// Go through the filters and queue to download the matches.
 			await BitcoinStore.IndexStore.ForeachFiltersAsync(async (filterModel) =>
@@ -363,220 +279,79 @@ namespace WalletWasabi.Services
 				{
 					await ProcessFilterModelAsync(filterModel, cancel);
 				}
-			}, new Height(bestKeyManagerHeight.Value + 1));
+			},
+			new Height(bestKeyManagerHeight.Value + 1));
 		}
 
-		private async Task LoadDummyMempoolAsync(SmartTransaction[] unconfirmedTransactions)
+		private async Task LoadDummyMempoolAsync()
 		{
-			try
+			if (BitcoinStore.TransactionStore.MempoolStore.IsEmpty())
 			{
-				using (await TransactionProcessingLock.LockAsync())
-				using (var client = new WasabiClient(Synchronizer.WasabiClient.TorClient.DestinationUriAction, Synchronizer.WasabiClient.TorClient.TorSocks5EndPoint))
+				return;
+			}
+
+			// Only clean the mempool if we're fully synchronized.
+			if (BitcoinStore.SmartHeaderChain.HashesLeft == 0)
+			{
+				try
 				{
+					using var client = new WasabiClient(Synchronizer.WasabiClient.TorClient.DestinationUriAction, Synchronizer.WasabiClient.TorClient.TorSocks5EndPoint);
 					var compactness = 10;
 
 					var mempoolHashes = await client.GetMempoolHashesAsync(compactness);
 
-					var count = 0;
-					foreach (var tx in unconfirmedTransactions)
+					var txsToProcess = new List<SmartTransaction>();
+					foreach (var tx in BitcoinStore.TransactionStore.MempoolStore.GetTransactions())
 					{
-						if (mempoolHashes.Contains(tx.GetHash().ToString().Substring(0, compactness)))
+						uint256 hash = tx.GetHash();
+						if (mempoolHashes.Contains(hash.ToString().Substring(0, compactness)))
 						{
-							tx.SetHeight(Height.Mempool);
-							await ProcessTransactionAsync(tx);
-							Mempool.TransactionHashes.TryAdd(tx.GetHash());
-
-							Logger.LogInfo<WalletService>($"Transaction was successfully tested against the backend's mempool hashes: {tx.GetHash()}.");
-							count++;
+							txsToProcess.Add(tx);
+							Logger.LogInfo($"Transaction was successfully tested against the backend's mempool hashes: {hash}.");
+						}
+						else
+						{
+							BitcoinStore.TransactionStore.MempoolStore.TryRemove(tx.GetHash(), out _);
 						}
 					}
 
-					if (count != unconfirmedTransactions.Length)
-					{
-						SerializeTransactionCache();
-					}
+					TransactionProcessor.Process(txsToProcess);
+				}
+				catch (Exception ex)
+				{
+					// When there's a connection failure do not clean the transactions, add them to processing.
+					TransactionProcessor.Process(BitcoinStore.TransactionStore.MempoolStore.GetTransactions());
+
+					Logger.LogWarning(ex);
 				}
 			}
-			catch (Exception ex)
+			else
 			{
-				// When there's a connection failure do not clean the transactions, add them to processing.
-				foreach (var tx in unconfirmedTransactions)
-				{
-					tx.SetHeight(Height.Mempool);
-					await ProcessTransactionAsync(tx);
-					Mempool.TransactionHashes.TryAdd(tx.GetHash());
-				}
-
-				Logger.LogWarning<WalletService>(ex);
+				TransactionProcessor.Process(BitcoinStore.TransactionStore.MempoolStore.GetTransactions());
 			}
 		}
 
 		private async Task ProcessFilterModelAsync(FilterModel filterModel, CancellationToken cancel)
 		{
-			if (ProcessedBlocks.ContainsKey(filterModel.BlockHash))
-			{
-				return;
-			}
-
 			var matchFound = filterModel.Filter.MatchAny(KeyManager.GetPubKeyScriptBytes(), filterModel.FilterKey);
-			if (!matchFound)
+			if (matchFound)
 			{
-				return;
-			}
+				Block currentBlock = await FetchBlockAsync(filterModel.Header.BlockHash, cancel); // Wait until not downloaded.
+				var height = new Height(filterModel.Header.Height);
 
-			Block currentBlock = await FetchBlockAsync(filterModel.BlockHash, cancel); // Wait until not downloaded.
-
-			if (await ProcessBlockAsync(filterModel.BlockHeight, currentBlock))
-			{
-				SerializeTransactionCache();
-			}
-		}
-
-		public HdPubKey GetReceiveKey(string label, IEnumerable<HdPubKey> dontTouch = null)
-		{
-			label = Guard.Correct(label);
-
-			// Make sure there's always 21 clean keys generated and indexed.
-			KeyManager.AssertCleanKeysIndexed(isInternal: false);
-
-			IEnumerable<HdPubKey> keys = KeyManager.GetKeys(KeyState.Clean, isInternal: false);
-			if (dontTouch != null)
-			{
-				keys = keys.Except(dontTouch);
-				if (!keys.Any())
+				var txsToProcess = new List<SmartTransaction>();
+				for (int i = 0; i < currentBlock.Transactions.Count; i++)
 				{
-					throw new InvalidOperationException($"{nameof(dontTouch)} covers all the possible keys.");
+					Transaction tx = currentBlock.Transactions[i];
+					txsToProcess.Add(new SmartTransaction(tx, height, currentBlock.GetHash(), i, firstSeen: currentBlock.Header.BlockTime));
 				}
+				TransactionProcessor.Process(txsToProcess);
+				KeyManager.SetBestHeight(height);
+
+				NewBlockProcessed?.Invoke(this, currentBlock);
 			}
 
-			var foundLabelless = keys.FirstOrDefault(x => !x.HasLabel); // Return the first labelless.
-			HdPubKey ret = foundLabelless ?? keys.RandomElement(); // Return the first, because that's the oldest.
-
-			ret.SetLabel(label, KeyManager);
-
-			return ret;
-		}
-
-		public List<SmartCoin> GetClusters(SmartCoin coin, List<SmartCoin> current, ILookup<Script, SmartCoin> lookupScriptPubKey, ILookup<uint256, SmartCoin> lookupSpenderTransactionId, ILookup<uint256, SmartCoin> lookupTransactionId)
-		{
-			Guard.NotNull(nameof(coin), coin);
-			if (current.Contains(coin))
-			{
-				return current;
-			}
-
-			var clusters = current.Concat(new List<SmartCoin> { coin }).ToList(); // The coin is the first elem in its cluster.
-
-			// If the script is the same then we have a match, no matter of the anonymity set.
-			foreach (var c in lookupScriptPubKey[coin.ScriptPubKey])
-			{
-				if (!clusters.Contains(c))
-				{
-					var h = GetClusters(c, clusters, lookupScriptPubKey, lookupSpenderTransactionId, lookupTransactionId);
-					foreach (var hr in h)
-					{
-						if (!clusters.Contains(hr))
-						{
-							clusters.Add(hr);
-						}
-					}
-				}
-			}
-
-			// If it spends someone and has not been sufficiently anonymized.
-			if (coin.AnonymitySet < ServiceConfiguration.PrivacyLevelStrong)
-			{
-				var c = lookupSpenderTransactionId[coin.TransactionId].FirstOrDefault(x => !clusters.Contains(x));
-				if (c != default)
-				{
-					var h = GetClusters(c, clusters, lookupScriptPubKey, lookupSpenderTransactionId, lookupTransactionId);
-					foreach (var hr in h)
-					{
-						if (!clusters.Contains(hr))
-						{
-							clusters.Add(hr);
-						}
-					}
-				}
-			}
-
-			// If it's being spent by someone and that someone has not been sufficiently anonymized.
-			if (!coin.Unspent)
-			{
-				var c = lookupTransactionId[coin.SpenderTransactionId].FirstOrDefault(x => !clusters.Contains(x));
-				if (c != default)
-				{
-					if (c.AnonymitySet < ServiceConfiguration.PrivacyLevelStrong)
-					{
-						if (c != default)
-						{
-							var h = GetClusters(c, clusters, lookupScriptPubKey, lookupSpenderTransactionId, lookupTransactionId);
-							foreach (var hr in h)
-							{
-								if (!clusters.Contains(hr))
-								{
-									clusters.Add(hr);
-								}
-							}
-						}
-					}
-				}
-			}
-
-			return clusters;
-		}
-
-		private async Task<bool> ProcessBlockAsync(Height height, Block block, IEnumerable<int> filterByTxIndexes = null, IEnumerable<SmartTransaction> skeletonBlock = null)
-		{
-			var ret = false;
-			using (await TransactionProcessingLock.LockAsync())
-			{
-				if (filterByTxIndexes is null)
-				{
-					var relevantIndicies = new List<int>();
-					for (int i = 0; i < block.Transactions.Count; i++)
-					{
-						Transaction tx = block.Transactions[i];
-						if (await ProcessTransactionAsync(new SmartTransaction(tx, height, block.GetHash(), i)))
-						{
-							relevantIndicies.Add(i);
-							ret = true;
-						}
-					}
-
-					if (relevantIndicies.Any())
-					{
-						var blockState = new BlockState(block.GetHash(), height, relevantIndicies);
-						KeyManager.AddBlockState(blockState, setItsHeightToBest: true); // Set the height here (so less toFile and lock.)
-					}
-					else
-					{
-						KeyManager.SetBestHeight(height);
-					}
-				}
-				else
-				{
-					foreach (var i in filterByTxIndexes.OrderBy(x => x))
-					{
-						var tx = skeletonBlock?.FirstOrDefault(x => x.BlockIndex == i) ?? new SmartTransaction(block.Transactions[i], height, block.GetHash(), i);
-						if (await ProcessTransactionAsync(tx))
-						{
-							ret = true;
-						}
-					}
-				}
-			}
-
-			ProcessedBlocks.TryAdd(block.GetHash(), (height, block.Header.BlockTime));
-
-			NewBlockProcessed?.Invoke(this, block);
-
-			return ret;
-		}
-
-		private async Task<bool> ProcessTransactionAsync(SmartTransaction tx)
-		{
-			return await Task.FromResult(TransactionProcessor.Process(tx));
+			LastProcessedFilter = filterModel;
 		}
 
 		private Node _localBitcoinCoreNode = null;
@@ -594,6 +369,8 @@ namespace WalletWasabi.Services
 			}
 			private set => _localBitcoinCoreNode = value;
 		}
+
+		public IFeeProvider FeeProvider { get; }
 
 		/// <param name="hash">Block hash of the desired block, represented as a 256 bit integer.</param>
 		/// <exception cref="OperationCanceledException"></exception>
@@ -624,11 +401,11 @@ namespace WalletWasabi.Services
 						var blockBytes = await File.ReadAllBytesAsync(filePath, cancel);
 						block = Block.Load(blockBytes, Synchronizer.Network);
 					}
-					catch (Exception)
+					catch
 					{
 						// In case the block file is corrupted and we get an EndOfStreamException exception
 						// Ignore any error and continue to re-downloading the block.
-						Logger.LogDebug<WalletService>($"Block {hash} file corrupted, deleting file and block will be re-downloaded.");
+						Logger.LogDebug($"Block {hash} file corrupted, deleting file and block will be re-downloaded.");
 						File.Delete(filePath);
 					}
 				}
@@ -644,8 +421,7 @@ namespace WalletWasabi.Services
 			Block block = null;
 			try
 			{
-				await BlockDownloadLock.LockAsync();
-				DownloadingBlock = true;
+				DownloadingBlockChanged?.Invoke(null, true);
 
 				while (true)
 				{
@@ -685,24 +461,22 @@ namespace WalletWasabi.Services
 							// Validate block
 							if (!block.Check())
 							{
-								Logger.LogInfo<WalletService>($"Disconnected node: {node.RemoteSocketAddress}, because invalid block received.");
+								Logger.LogInfo($"Disconnected node: {node.RemoteSocketAddress}, because invalid block received.");
 								node.DisconnectAsync("Invalid block received.");
 								continue;
 							}
 
 							if (Nodes.ConnectedNodes.Count > 1) // To minimize risking missing unconfirmed transactions.
 							{
-								Logger.LogInfo<WalletService>($"Disconnected node: {node.RemoteSocketAddress}. Block downloaded: {block.GetHash()}.");
+								Logger.LogInfo($"Disconnected node: {node.RemoteSocketAddress}. Block downloaded: {block.GetHash()}.");
 								node.DisconnectAsync("Thank you!");
 							}
 
 							await NodeTimeoutsAsync(false);
 						}
-						catch (Exception ex) when (ex is OperationCanceledException
-												|| ex is TaskCanceledException
-												|| ex is TimeoutException)
+						catch (Exception ex) when (ex is OperationCanceledException || ex is TaskCanceledException || ex is TimeoutException)
 						{
-							Logger.LogInfo<WalletService>($"Disconnected node: {node.RemoteSocketAddress}, because block download took too long.");
+							Logger.LogInfo($"Disconnected node: {node.RemoteSocketAddress}, because block download took too long.");
 
 							await NodeTimeoutsAsync(true);
 
@@ -711,8 +485,8 @@ namespace WalletWasabi.Services
 						}
 						catch (Exception ex)
 						{
-							Logger.LogDebug<WalletService>(ex);
-							Logger.LogInfo<WalletService>($"Disconnected node: {node.RemoteSocketAddress}, because block download failed: {ex.Message}.");
+							Logger.LogDebug(ex);
+							Logger.LogInfo($"Disconnected node: {node.RemoteSocketAddress}, because block download failed: {ex.Message}.");
 							node.DisconnectAsync("Block download failed.");
 							continue;
 						}
@@ -721,7 +495,7 @@ namespace WalletWasabi.Services
 					}
 					catch (Exception ex)
 					{
-						Logger.LogDebug<WalletService>(ex);
+						Logger.LogDebug(ex);
 					}
 				}
 
@@ -734,8 +508,7 @@ namespace WalletWasabi.Services
 			}
 			finally
 			{
-				DownloadingBlock = false;
-				BlockDownloadLock.ReleaseLock();
+				DownloadingBlockChanged?.Invoke(null, false);
 			}
 
 			return block;
@@ -743,19 +516,20 @@ namespace WalletWasabi.Services
 
 		private async Task<Block> TryDownloadBlockFromLocalNodeAsync(uint256 hash, CancellationToken cancel)
 		{
-			try
+			if (CoreNode?.RpcClient is null)
 			{
-				if (LocalBitcoinCoreNode is null || (!LocalBitcoinCoreNode.IsConnected && Network != Network.RegTest)) // If RegTest then we're already connected do not try again.
+				try
 				{
-					DisconnectDisposeNullLocalBitcoinCoreNode();
-					using (var handshakeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancel))
+					if (LocalBitcoinCoreNode is null || (!LocalBitcoinCoreNode.IsConnected && Network != Network.RegTest)) // If RegTest then we're already connected do not try again.
 					{
+						DisconnectDisposeNullLocalBitcoinCoreNode();
+						using var handshakeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancel);
 						handshakeTimeout.CancelAfter(TimeSpan.FromSeconds(10));
 						var nodeConnectionParameters = new NodeConnectionParameters()
 						{
 							ConnectCancellation = handshakeTimeout.Token,
 							IsRelay = false,
-							UserAgent = $"/Wasabi:{Constants.ClientVersion.ToVersionString()}/"
+							UserAgent = $"/Wasabi:{Constants.ClientVersion.ToString()}/"
 						};
 
 						// If an onion was added must try to use Tor.
@@ -769,7 +543,7 @@ namespace WalletWasabi.Services
 						var localNode = await Node.ConnectAsync(Network, localEndPoint, nodeConnectionParameters);
 						try
 						{
-							Logger.LogInfo<WalletService>("TCP Connection succeeded, handshaking...");
+							Logger.LogInfo("TCP Connection succeeded, handshaking...");
 							localNode.VersionHandshake(Constants.LocalNodeRequirements, handshakeTimeout.Token);
 							var peerServices = localNode.PeerVersion.Services;
 
@@ -778,7 +552,7 @@ namespace WalletWasabi.Services
 							//	throw new InvalidOperationException("Wasabi cannot use the local node because it does not provide blocks.");
 							//}
 
-							Logger.LogInfo<WalletService>("Handshake completed successfully.");
+							Logger.LogInfo("Handshake completed successfully.");
 
 							if (!localNode.IsConnected)
 							{
@@ -789,42 +563,55 @@ namespace WalletWasabi.Services
 						}
 						catch (OperationCanceledException) when (handshakeTimeout.IsCancellationRequested)
 						{
-							Logger.LogWarning<Node>($"Wasabi could not complete the handshake with the local node. Probably Wasabi is not whitelisted by the node.{Environment.NewLine}" +
+							Logger.LogWarning($"Wasabi could not complete the handshake with the local node. Probably Wasabi is not whitelisted by the node.{Environment.NewLine}" +
 								"Use \"whitebind\" in the node configuration. (Typically whitebind=127.0.0.1:8333 if Wasabi and the node are on the same machine and whitelist=1.2.3.4 if they are not.)");
 							throw;
 						}
 					}
-				}
 
-				// Get Block from local node
-				Block blockFromLocalNode = null;
-				// Should timeout faster. Not sure if it should ever fail though. Maybe let's keep like this later for remote node connection.
-				using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(64)))
+					// Get Block from local node
+					Block blockFromLocalNode = null;
+					// Should timeout faster. Not sure if it should ever fail though. Maybe let's keep like this later for remote node connection.
+					using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(64)))
+					{
+						blockFromLocalNode = await LocalBitcoinCoreNode.DownloadBlockAsync(hash, cts.Token);
+					}
+
+					// Validate retrieved block
+					if (!blockFromLocalNode.Check())
+					{
+						throw new InvalidOperationException("Disconnected node, because invalid block received!");
+					}
+
+					// Retrieved block from local node and block is valid
+					Logger.LogInfo($"Block acquired from local P2P connection: {hash}.");
+					return blockFromLocalNode;
+				}
+				catch (Exception ex)
 				{
-					blockFromLocalNode = await LocalBitcoinCoreNode.DownloadBlockAsync(hash, cts.Token);
-				}
+					DisconnectDisposeNullLocalBitcoinCoreNode();
 
-				// Validate retrieved block
-				if (!blockFromLocalNode.Check())
-				{
-					throw new InvalidOperationException("Disconnected node, because invalid block received!");
+					if (ex is SocketException)
+					{
+						Logger.LogTrace("Did not find local listening and running full node instance. Trying to fetch needed block from other source.");
+					}
+					else
+					{
+						Logger.LogWarning(ex);
+					}
 				}
-
-				// Retrieved block from local node and block is valid
-				Logger.LogInfo<WalletService>($"Block acquired from local P2P connection: {hash}.");
-				return blockFromLocalNode;
 			}
-			catch (Exception ex)
+			else
 			{
-				DisconnectDisposeNullLocalBitcoinCoreNode();
-
-				if (ex is SocketException)
+				try
 				{
-					Logger.LogTrace<WalletService>("Did not find local listening and running full node instance. Trying to fetch needed block from other source.");
+					var block = await CoreNode.RpcClient.GetBlockAsync(hash).ConfigureAwait(false);
+					Logger.LogInfo($"Block acquired from RPC connection: {hash}.");
+					return block;
 				}
-				else
+				catch (Exception ex)
 				{
-					Logger.LogWarning<WalletService>(ex);
+					Logger.LogWarning(ex);
 				}
 			}
 
@@ -841,7 +628,7 @@ namespace WalletWasabi.Services
 				}
 				catch (Exception ex)
 				{
-					Logger.LogDebug<WalletService>(ex);
+					Logger.LogDebug(ex);
 				}
 				finally
 				{
@@ -851,12 +638,12 @@ namespace WalletWasabi.Services
 					}
 					catch (Exception ex)
 					{
-						Logger.LogDebug<WalletService>(ex);
+						Logger.LogDebug(ex);
 					}
 					finally
 					{
 						LocalBitcoinCoreNode = null;
-						Logger.LogInfo<WalletService>("Local Bitcoin Core node disconnected.");
+						Logger.LogInfo("Local Bitcoin Core node disconnected.");
 					}
 				}
 			}
@@ -883,7 +670,7 @@ namespace WalletWasabi.Services
 			}
 			catch (Exception ex)
 			{
-				Logger.LogWarning<WalletService>(ex);
+				Logger.LogWarning(ex);
 			}
 		}
 
@@ -900,497 +687,50 @@ namespace WalletWasabi.Services
 		/// <exception cref="ArgumentException"></exception>
 		/// <exception cref="ArgumentNullException"></exception>
 		/// <exception cref="ArgumentOutOfRangeException"></exception>
-		public BuildTransactionResult BuildTransaction(string password,
-														PaymentIntent payments,
-														FeeStrategy feeStrategy,
-														bool allowUnconfirmed = false,
-														IEnumerable<TxoRef> allowedInputs = null)
+		public BuildTransactionResult BuildTransaction(
+			string password,
+			PaymentIntent payments,
+			FeeStrategy feeStrategy,
+			bool allowUnconfirmed = false,
+			IEnumerable<TxoRef> allowedInputs = null)
 		{
-			password = password ?? ""; // Correction.
-			payments = Guard.NotNull(nameof(payments), payments);
-
-			long totalAmount = payments.TotalAmount.Satoshi;
-			if (totalAmount < 0 || totalAmount > Constants.MaximumNumberOfSatoshis)
-			{
-				throw new ArgumentOutOfRangeException($"{nameof(payments)}.{nameof(payments.TotalAmount)} sum cannot be smaller than 0 or greater than {Constants.MaximumNumberOfSatoshis}.");
-			}
-
-			// Get allowed coins to spend.
-			List<SmartCoin> allowedSmartCoinInputs; // Inputs that can be used to build the transaction.
-			if (allowedInputs != null) // If allowedInputs are specified then select the coins from them.
-			{
-				if (!allowedInputs.Any())
+			var builder = new TransactionFactory(Network, KeyManager, Coins, password, allowUnconfirmed);
+			return builder.BuildTransaction(
+				payments,
+				() =>
 				{
-					throw new ArgumentException($"{nameof(allowedInputs)} is not null, but empty.");
-				}
-
-				allowedSmartCoinInputs = allowUnconfirmed
-					? Coins.Where(x => !x.Unavailable && allowedInputs.Any(y => y.TransactionId == x.TransactionId && y.Index == x.Index)).ToList()
-					: Coins.Where(x => !x.Unavailable && x.Confirmed && allowedInputs.Any(y => y.TransactionId == x.TransactionId && y.Index == x.Index)).ToList();
-
-				// Add those that have the same script, because common ownership is already exposed.
-				// But only if the user didn't click the "max" button. In this case he'd send more money than what he'd think.
-				if (payments.ChangeStrategy != ChangeStrategy.AllRemainingCustom)
-				{
-					var allScripts = allowedSmartCoinInputs.Select(x => x.ScriptPubKey).ToHashSet();
-					foreach (var coin in Coins.Where(x => !x.Unavailable && !allowedSmartCoinInputs.Any(y => x.TransactionId == y.TransactionId && x.Index == y.Index)))
+					if (feeStrategy.Type == FeeStrategyType.Target)
 					{
-						if (!(allowUnconfirmed || coin.Confirmed))
-						{
-							continue;
-						}
-
-						if (allScripts.Contains(coin.ScriptPubKey))
-						{
-							allowedSmartCoinInputs.Add(coin);
-						}
+						return FeeProvider.AllFeeEstimate?.GetFeeRate(feeStrategy.Target) ?? throw new InvalidOperationException("Cannot get fee estimations.");
 					}
-				}
-			}
-			else
-			{
-				allowedSmartCoinInputs = allowUnconfirmed ? Coins.Where(x => !x.Unavailable).ToList() : Coins.Where(x => !x.Unavailable && x.Confirmed).ToList();
-			}
-
-			// Get and calculate fee
-			Logger.LogInfo<WalletService>("Calculating dynamic transaction fee...");
-
-			FeeRate feeRate;
-			if (feeStrategy.Type == FeeStrategyType.Target)
-			{
-				feeRate = Synchronizer.GetFeeRate(feeStrategy.Target);
-			}
-			else if (feeStrategy.Type == FeeStrategyType.Rate)
-			{
-				feeRate = feeStrategy.Rate;
-			}
-			else
-			{
-				throw new NotSupportedException(feeStrategy.Type.ToString());
-			}
-
-			var smartCoinsByOutpoint = allowedSmartCoinInputs.ToDictionary(s => s.GetOutPoint());
-			TransactionBuilder builder = Network.CreateTransactionBuilder();
-			builder.SetCoinSelector(new SmartCoinSelector(smartCoinsByOutpoint));
-			builder.AddCoins(allowedSmartCoinInputs.Select(c => c.GetCoin()));
-
-			foreach (var request in payments.Requests.Where(x => x.Amount.Type == MoneyRequestType.Value))
-			{
-				var amountRequest = request.Amount;
-
-				builder.Send(request.Destination, amountRequest.Amount);
-				if (amountRequest.SubtractFee)
-				{
-					builder.SubtractFees();
-				}
-			}
-
-			HdPubKey changeHdPubKey = null;
-
-			if (payments.TryGetCustomRequest(out DestinationRequest custChange))
-			{
-				var changeScript = custChange.Destination.ScriptPubKey;
-				changeHdPubKey = KeyManager.GetKeyForScriptPubKey(changeScript);
-
-				var changeStrategy = payments.ChangeStrategy;
-				if (changeStrategy == ChangeStrategy.Custom)
-				{
-					builder.SetChange(changeScript);
-				}
-				else if (changeStrategy == ChangeStrategy.AllRemainingCustom)
-				{
-					builder.SendAllRemaining(changeScript);
-				}
-				else
-				{
-					throw new NotSupportedException(payments.ChangeStrategy.ToString());
-				}
-			}
-			else
-			{
-				KeyManager.AssertCleanKeysIndexed(isInternal: true);
-				KeyManager.AssertLockedInternalKeysIndexed(14);
-				changeHdPubKey = KeyManager.GetKeys(KeyState.Clean, true).RandomElement();
-
-				builder.SetChange(changeHdPubKey.P2wpkhScript);
-			}
-
-			builder.SendEstimatedFees(feeRate);
-
-			var psbt = builder.BuildPSBT(false);
-
-			var spentCoins = psbt.Inputs.Select(txin => smartCoinsByOutpoint[txin.PrevOut]).ToArray();
-
-			var realToSend = payments.Requests
-				.Select(t =>
-					(label: t.Label,
-					destination: t.Destination,
-					amount: psbt.Outputs.FirstOrDefault(o => o.ScriptPubKey == t.Destination.ScriptPubKey)?.Value))
-				.Where(i => i.amount != null);
-
-			if (!psbt.TryGetFee(out var fee))
-			{
-				throw new InvalidOperationException("Impossible to get the fees of the PSBT, this should never happen.");
-			}
-			Logger.LogInfo<WalletService>($"Fee: {fee.Satoshi} Satoshi.");
-
-			var vSize = builder.EstimateSize(psbt.GetOriginalTransaction(), true);
-			Logger.LogInfo<WalletService>($"Estimated tx size: {vSize} vbytes.");
-
-			// Do some checks
-			Money totalSendAmountNoFee = realToSend.Sum(x => x.amount);
-			if (totalSendAmountNoFee == Money.Zero)
-			{
-				throw new InvalidOperationException("The amount after subtracting the fee is too small to be sent.");
-			}
-			Money totalSendAmount = totalSendAmountNoFee + fee;
-
-			Money totalOutgoingAmountNoFee;
-			if (changeHdPubKey is null)
-			{
-				totalOutgoingAmountNoFee = totalSendAmountNoFee;
-			}
-			else
-			{
-				totalOutgoingAmountNoFee = realToSend.Where(x => !changeHdPubKey.ContainsScript(x.destination.ScriptPubKey)).Sum(x => x.amount);
-			}
-			decimal totalOutgoingAmountNoFeeDecimal = totalOutgoingAmountNoFee.ToDecimal(MoneyUnit.BTC);
-			// Cannot divide by zero, so use the closest number we have to zero.
-			decimal totalOutgoingAmountNoFeeDecimalDivisor = totalOutgoingAmountNoFeeDecimal == 0 ? decimal.MinValue : totalOutgoingAmountNoFeeDecimal;
-			decimal feePc = (100 * fee.ToDecimal(MoneyUnit.BTC)) / totalOutgoingAmountNoFeeDecimalDivisor;
-
-			if (feePc > 1)
-			{
-				Logger.LogInfo<WalletService>($"The transaction fee is {totalOutgoingAmountNoFee:0.#}% of your transaction amount.{Environment.NewLine}"
-					+ $"Sending:\t {totalSendAmount.ToString(fplus: false, trimExcessZero: true)} BTC.{Environment.NewLine}"
-					+ $"Fee:\t\t {fee.Satoshi} Satoshi.");
-			}
-			if (feePc > 100)
-			{
-				throw new InvalidOperationException($"The transaction fee is more than twice the transaction amount: {feePc:0.#}%.");
-			}
-
-			if (spentCoins.Any(u => !u.Confirmed))
-			{
-				Logger.LogInfo<WalletService>("Unconfirmed transaction is spent.");
-			}
-
-			// Build the transaction
-			Logger.LogInfo<WalletService>("Signing transaction...");
-			// It must be watch only, too, because if we have the key and also hardware wallet, we do not care we can sign.
-
-			Transaction tx = null;
-			if (KeyManager.IsWatchOnly)
-			{
-				tx = psbt.GetGlobalTransaction();
-			}
-			else
-			{
-				IEnumerable<ExtKey> signingKeys = KeyManager.GetSecrets(password, spentCoins.Select(x => x.ScriptPubKey).ToArray());
-				builder = builder.AddKeys(signingKeys.ToArray());
-				builder.SignPSBT(psbt);
-				psbt.Finalize();
-				tx = psbt.ExtractTransaction();
-
-				var checkResults = builder.Check(tx).ToList();
-				if (!psbt.TryGetEstimatedFeeRate(out FeeRate actualFeeRate))
-				{
-					throw new InvalidOperationException("Impossible to get the fee rate of the PSBT, this should never happen.");
-				}
-
-				// Manually check the feerate, because some inaccuracy is possible.
-				var sb1 = feeRate.SatoshiPerByte;
-				var sb2 = actualFeeRate.SatoshiPerByte;
-				if (Math.Abs(sb1 - sb2) > 2) // 2s/b inaccuracy ok.
-				{
-					// So it'll generate a transactionpolicy error thrown below.
-					checkResults.Add(new NotEnoughFundsPolicyError("Fees different than expected"));
-				}
-				if (checkResults.Count > 0)
-				{
-					throw new InvalidTxException(tx, checkResults);
-				}
-			}
-
-			if (KeyManager.MasterFingerprint is HDFingerprint fp)
-			{
-				foreach (var coin in spentCoins)
-				{
-					var rootKeyPath = new RootedKeyPath(fp, coin.HdPubKey.FullKeyPath);
-					psbt.AddKeyPath(coin.HdPubKey.PubKey, rootKeyPath, coin.ScriptPubKey);
-				}
-			}
-
-			var labelBuilder = new LabelBuilder();
-			foreach (var label in payments.Requests.Select(x => x.Label))
-			{
-				labelBuilder.Add(label);
-			}
-			var outerWalletOutputs = new List<SmartCoin>();
-			var innerWalletOutputs = new List<SmartCoin>();
-			for (var i = 0U; i < tx.Outputs.Count; i++)
-			{
-				TxOut output = tx.Outputs[i];
-				var anonset = (tx.GetAnonymitySet(i) + spentCoins.Min(x => x.AnonymitySet)) - 1; // Minus 1, because count own only once.
-				var foundKey = KeyManager.GetKeyForScriptPubKey(output.ScriptPubKey);
-				var coin = new SmartCoin(tx.GetHash(), i, output.ScriptPubKey, output.Value, tx.Inputs.ToTxoRefs().ToArray(), Height.Unknown, tx.RBF, anonset, isLikelyCoinJoinOutput: false, pubKey: foundKey);
-				labelBuilder.Add(coin.Label); // foundKey's label is already added to the coinlabel.
-
-				if (foundKey is null)
-				{
-					outerWalletOutputs.Add(coin);
-				}
-				else
-				{
-					innerWalletOutputs.Add(coin);
-				}
-			}
-
-			foreach (var coin in outerWalletOutputs.Concat(innerWalletOutputs))
-			{
-				var foundPaymentRequest = payments.Requests.FirstOrDefault(x => x.Destination.ScriptPubKey == coin.ScriptPubKey);
-
-				// If change then we concatenate all the labels.
-				if (foundPaymentRequest is null) // Then it's autochange.
-				{
-					coin.Label = labelBuilder.ToString();
-				}
-				else
-				{
-					coin.Label = new LabelBuilder(coin.Label, foundPaymentRequest.Label).ToString();
-				}
-
-				var foundKey = KeyManager.GetKeyForScriptPubKey(coin.ScriptPubKey);
-				foundKey?.SetLabel(coin.Label); // The foundkeylabel has already been added previously, so no need to concatenate.
-			}
-
-			Logger.LogInfo<WalletService>($"Transaction is successfully built: {tx.GetHash()}.");
-			var sign = !KeyManager.IsWatchOnly;
-			var spendsUnconfirmed = spentCoins.Any(c => !c.Confirmed);
-			return new BuildTransactionResult(new SmartTransaction(tx, Height.Unknown), psbt, spendsUnconfirmed, sign, fee, feePc, outerWalletOutputs, innerWalletOutputs, spentCoins);
-		}
-
-		public void RenameLabel(SmartCoin coin, string newLabel)
-		{
-			newLabel = Guard.Correct(newLabel);
-			coin.Label = newLabel;
-			var key = KeyManager.GetKeys(x => x.P2wpkhScript == coin.ScriptPubKey).SingleOrDefault();
-			if (key != null)
-			{
-				key.SetLabel(newLabel, KeyManager);
-			}
-		}
-
-		private static long SendCount = 0;
-
-		public async Task SendTransactionAsync(SmartTransaction transaction)
-		{
-			try
-			{
-				Interlocked.Increment(ref SendCount);
-				// Broadcast to a random node.
-				// Wait until it arrives to at least two other nodes.
-				// If something's wrong, fall back broadcasting with backend.
-
-				if (Network == Network.RegTest)
-				{
-					throw new InvalidOperationException($"Transaction broadcasting to nodes does not work in {Network.RegTest}.");
-				}
-
-				while (true)
-				{
-					// As long as we are connected to at least 4 nodes, we can always try again.
-					// 3 should be enough, but make it 5 so 2 nodes could disconnect the meantime.
-					if (Nodes.ConnectedNodes.Count < 5)
+					else if (feeStrategy.Type == FeeStrategyType.Rate)
 					{
-						throw new InvalidOperationException("We are not connected to enough nodes.");
-					}
-
-					Node node = Nodes.ConnectedNodes.RandomElement();
-					if (node == default(Node))
-					{
-						await Task.Delay(100);
-						continue;
-					}
-
-					if (!node.IsConnected)
-					{
-						await Task.Delay(100);
-						continue;
-					}
-
-					Logger.LogInfo<WalletService>($"Trying to broadcast transaction with random node ({node.RemoteSocketAddress}):{transaction.GetHash()}.");
-					var addedToBroadcastStore = Mempool.TryAddToBroadcastStore(transaction.Transaction, node.RemoteSocketEndpoint.ToString()); // So we'll reply to INV with this transaction.
-					if (!addedToBroadcastStore)
-					{
-						Logger.LogWarning<WalletService>($"Transaction {transaction.GetHash()} was already present in the broadcast store.");
-					}
-					var invPayload = new InvPayload(transaction.Transaction);
-					// Give 7 seconds to send the inv payload.
-					using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(7)))
-					{
-						await node.SendMessageAsync(invPayload).WithCancellation(cts.Token); // ToDo: It's dangerous way to cancel. Implement proper cancellation to NBitcoin!
-					}
-
-					if (Mempool.TryGetFromBroadcastStore(transaction.GetHash(), out TransactionBroadcastEntry entry))
-					{
-						// Give 7 seconds for serving.
-						var timeout = 0;
-						while (!entry.IsBroadcasted())
-						{
-							if (timeout > 7)
-							{
-								throw new TimeoutException("Did not serve the transaction.");
-							}
-							await Task.Delay(1_000);
-							timeout++;
-						}
-						node.DisconnectAsync("Thank you!");
-						Logger.LogInfo<MempoolBehavior>($"Disconnected node: {node.RemoteSocketAddress}. Successfully broadcasted transaction: {transaction.GetHash()}.");
-
-						// Give 21 seconds for propagation.
-						timeout = 0;
-						while (entry.GetPropagationConfirmations() < 2)
-						{
-							if (timeout > 21)
-							{
-								throw new TimeoutException("Did not serve the transaction.");
-							}
-							await Task.Delay(1_000);
-							timeout++;
-						}
-						Logger.LogInfo<MempoolBehavior>($"Transaction is successfully propagated: {transaction.GetHash()}.");
+						return feeStrategy.Rate;
 					}
 					else
 					{
-						Logger.LogWarning<WalletService>($"Expected transaction {transaction.GetHash()} was not found in the broadcast store.");
+						throw new NotSupportedException(feeStrategy.Type.ToString());
 					}
-					break;
-				}
-			}
-			catch (Exception ex)
-			{
-				Logger.LogInfo<WalletService>($"Random node could not broadcast transaction. Broadcasting with backend... Reason: {ex.Message}.");
-				Logger.LogDebug<WalletService>(ex);
-
-				using (var client = new WasabiClient(Synchronizer.WasabiClient.TorClient.DestinationUriAction, Synchronizer.WasabiClient.TorClient.TorSocks5EndPoint))
-				{
-					try
-					{
-						await client.BroadcastAsync(transaction);
-					}
-					catch (HttpRequestException ex2) when (
-						ex2.Message.Contains("bad-txns-inputs-missingorspent", StringComparison.InvariantCultureIgnoreCase)
-						|| ex2.Message.Contains("missing-inputs", StringComparison.InvariantCultureIgnoreCase)
-						|| ex2.Message.Contains("txn-mempool-conflict", StringComparison.InvariantCultureIgnoreCase))
-					{
-						if (transaction.Transaction.Inputs.Count == 1) // If we tried to only spend one coin, then we can mark it as spent. If there were more coins, then we do not know.
-						{
-							OutPoint input = transaction.Transaction.Inputs.First().PrevOut;
-							SmartCoin coin = Coins.FirstOrDefault(x => x.TransactionId == input.Hash && x.Index == input.N);
-							if (coin != default)
-							{
-								coin.SpentAccordingToBackend = true;
-							}
-						}
-					}
-				}
-
-				using (await TransactionProcessingLock.LockAsync())
-				{
-					if (await ProcessTransactionAsync(new SmartTransaction(transaction.Transaction, Height.Mempool)))
-					{
-						SerializeTransactionCache();
-					}
-
-					Mempool.TransactionHashes.TryAdd(transaction.GetHash());
-				}
-
-				Logger.LogInfo<WalletService>($"Transaction is successfully broadcasted to backend: {transaction.GetHash()}.");
-			}
-			finally
-			{
-				Mempool.TryRemoveFromBroadcastStore(transaction.GetHash(), out _); // Remove it just to be sure. Probably has been removed previously.
-				Interlocked.Decrement(ref SendCount);
-			}
+				},
+				allowedInputs);
 		}
 
-		public ISet<string> GetLabels()
+		public void RenameLabel(SmartCoin coin, SmartLabel newLabel)
 		{
-			return Coins
-				.SelectMany(x => x.Label.Split(',', StringSplitOptions.RemoveEmptyEntries))
-				.Select(x => x.Trim())
-				.ToHashSet();
-		}
-
-		private int _refreshCoinHistoriesRerunRequested = 0;
-		private int _refreshCoinHistoriesRunning = 0;
-
-		public void RefreshCoinHistories()
-		{
-			// If already running, then make sure another run is requested, else do the work.
-			if (Interlocked.CompareExchange(ref _refreshCoinHistoriesRunning, 1, 0) == 1)
+			coin.Label = newLabel ?? SmartLabel.Empty;
+			var key = KeyManager.GetKeys(x => x.P2wpkhScript == coin.ScriptPubKey).SingleOrDefault();
+			if (key != null)
 			{
-				Interlocked.Exchange(ref _refreshCoinHistoriesRerunRequested, 1);
-				return;
-			}
-
-			try
-			{
-				var unspentCoins = Coins.Where(c => c.Unspent); //refreshing unspent coins clusters only
-				if (unspentCoins.Any())
-				{
-					ILookup<Script, SmartCoin> lookupScriptPubKey = Coins.ToLookup(c => c.ScriptPubKey, c => c);
-					ILookup<uint256, SmartCoin> lookupSpenderTransactionId = Coins.ToLookup(c => c.SpenderTransactionId, c => c);
-					ILookup<uint256, SmartCoin> lookupTransactionId = Coins.ToLookup(c => c.TransactionId, c => c);
-
-					const int simultaneousThread = 2; //threads allowed to run simultaneously in threadpool
-
-					Parallel.ForEach(unspentCoins, new ParallelOptions { MaxDegreeOfParallelism = simultaneousThread }, coin =>
-					{
-						var result = string.Join(
-							", ",
-							GetClusters(coin, new List<SmartCoin>(), lookupScriptPubKey, lookupSpenderTransactionId, lookupTransactionId)
-							.SelectMany(x => x.Label
-								.Split(',', StringSplitOptions.RemoveEmptyEntries)
-								.Select(y => y.Trim()))
-							.Distinct());
-						coin.SetClusters(result);
-					});
-				}
-			}
-			catch (Exception ex)
-			{
-				Logger.LogError<WalletService>($"Refreshing coin clusters failed: {ex}.");
-			}
-			finally
-			{
-				// It's not running anymore, but someone may requested another run.
-				Interlocked.Exchange(ref _refreshCoinHistoriesRunning, 0);
-
-				// Clear the rerun request, too and if it was requested, then rerun.
-				if (Interlocked.Exchange(ref _refreshCoinHistoriesRerunRequested, 0) == 1)
-				{
-					RefreshCoinHistories();
-				}
+				key.SetLabel(coin.Label, KeyManager);
 			}
 		}
 
-		public bool UnconfirmedTransactionsInitialized { get; private set; } = false;
-
-		private void SerializeTransactionCache()
-		{
-			if (!UnconfirmedTransactionsInitialized) // If unconfirmed ones are not yet initialized, then do not serialize because unconfirmed are going to be lost.
-			{
-				return;
-			}
-
-			IoHelpers.EnsureContainingDirectoryExists(TransactionsFilePath);
-			string jsonString = JsonConvert.SerializeObject(TransactionCache.OrderByBlockchain(), Formatting.Indented);
-			File.WriteAllText(TransactionsFilePath,
-				jsonString,
-				Encoding.UTF8);
-		}
+		public ISet<string> GetLabels() => TransactionProcessor.Coins.AsAllCoinsView()
+			.SelectMany(x => x.Label.Labels)
+			.Concat(KeyManager
+				.GetKeys()
+				.SelectMany(x => x.Label.Labels))
+			.ToHashSet();
 
 		/// <summary>
 		/// Current timeout used when downloading a block from the remote node. It is defined in seconds.
@@ -1438,29 +778,43 @@ namespace WalletWasabi.Services
 			RuntimeParams.Instance.NetworkNodeTimeout = timeout;
 			await RuntimeParams.Instance.SaveAsync();
 
-			Logger.LogInfo<WalletService>($"Current timeout value used on block download is: {timeout} seconds.");
+			Logger.LogInfo($"Current timeout value used on block download is: {timeout} seconds.");
 		}
 
-		public async Task StopAsync()
+		#region IDisposable Support
+
+		private volatile bool _disposedValue = false; // To detect redundant calls
+
+		public bool IsDisposed => _disposedValue;
+
+		public CoreNode CoreNode { get; }
+		public FilterModel LastProcessedFilter { get; private set; }
+
+		protected virtual void Dispose(bool disposing)
 		{
-			while (Interlocked.Read(ref SendCount) != 0) // Make sure to wait for send to finish.
+			if (!_disposedValue)
 			{
-				await Task.Delay(50);
+				if (disposing)
+				{
+					BitcoinStore.IndexStore.NewFilter -= IndexDownloader_NewFilterAsync;
+					BitcoinStore.IndexStore.Reorged -= IndexDownloader_ReorgedAsync;
+					BitcoinStore.MempoolService.TransactionReceived -= Mempool_TransactionReceived;
+					TransactionProcessor.WalletRelevantTransactionProcessed -= TransactionProcessor_WalletRelevantTransactionProcessedAsync;
+
+					DisconnectDisposeNullLocalBitcoinCoreNode();
+				}
+
+				_disposedValue = true;
 			}
-
-			BitcoinStore.IndexStore.NewFilter -= IndexDownloader_NewFilterAsync;
-			BitcoinStore.IndexStore.Reorged -= IndexDownloader_ReorgedAsync;
-			Mempool.TransactionReceived -= Mempool_TransactionReceivedAsync;
-			Coins.CollectionChanged -= Coins_CollectionChanged;
-			TransactionProcessor.CoinSpent -= TransactionProcessor_CoinSpent;
-			TransactionProcessor.CoinReceived -= TransactionProcessor_CoinReceivedAsync;
-
-			DisconnectDisposeNullLocalBitcoinCoreNode();
 		}
 
-		public SmartTransaction TryGetTxFromCache(uint256 txId)
+		// This code added to correctly implement the disposable pattern.
+		public void Dispose()
 		{
-			return TransactionCache.FirstOrDefault(x => x.GetHash() == txId);
+			// Do not change this code. Put cleanup code in Dispose(bool disposing) above.
+			Dispose(true);
 		}
+
+		#endregion IDisposable Support
 	}
 }
